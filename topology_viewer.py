@@ -35,6 +35,13 @@ class TopologyConfig:
     node_size_compute: int = 60
     show_labels: bool = False
 
+    # Global wiring style
+    global_mode: str = "aurora"          # "aurora" (all-to-all) or "sparse"
+    sparse_group_degree: int = 3         # used if global_mode == "sparse" (neighbors on ring)
+
+    global_mapping: str = "round_robin"  # "round_robin" or "random"
+
+
 
 def generate_aurora_like(cfg: TopologyConfig) -> nx.MultiGraph:
     rnd = random.Random(cfg.seed)
@@ -87,21 +94,58 @@ def generate_aurora_like(cfg: TopologyConfig) -> nx.MultiGraph:
                     if rnd.random() < cfg.dense_p:
                         G.add_edge(switch_ids[i], switch_ids[j], kind="intra")
 
-    # Global links: connect compute groups all-to-all like 1-D dragonfly
-    # (We skip storage/service specifics for now; add later if needed.)
+    # --- Global links: compute groups connectivity ---
     compute_group_ids = list(range(cfg.compute_groups))
-    for ga in range(len(compute_group_ids)):
-        for gb in range(ga + 1, len(compute_group_ids)):
-            gid_a = compute_group_ids[ga]
-            gid_b = compute_group_ids[gb]
 
-            # Choose random switches to host global links
-            switches_a = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d["group"] == gid_a]
-            switches_b = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d["group"] == gid_b]
+    def switches_in_group(gid: int) -> List[str]:
+        return [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d["group"] == gid]
 
+    # Precompute deterministic ordering of switches by index in name g{gid}_s{idx}
+    def ordered_switches(gid: int) -> List[str]:
+        sw = switches_in_group(gid)
+        # sort by the integer after "_s"
+        sw.sort(key=lambda x: int(x.split("_s")[1]))
+        return sw
+
+    # Choose which group pairs to connect depending on mode
+    group_pairs: List[Tuple[int, int]] = []
+
+    if cfg.global_mode == "aurora":
+        # all-to-all pairs
+        for i in range(len(compute_group_ids)):
+            for j in range(i + 1, len(compute_group_ids)):
+                group_pairs.append((compute_group_ids[i], compute_group_ids[j]))
+    else:
+        # sparse ring: each group connects to next K groups (wrap-around)
+        K = max(1, cfg.sparse_group_degree)
+        for i in compute_group_ids:
+            for step in range(1, K + 1):
+                j = (i + step) % cfg.compute_groups
+                if i < j:
+                    group_pairs.append((i, j))
+                else:
+                    # ensure uniqueness
+                    group_pairs.append((j, i))
+        group_pairs = sorted(set(group_pairs))
+
+    for gid_a, gid_b in group_pairs:
+        sw_a = ordered_switches(gid_a)
+        sw_b = ordered_switches(gid_b)
+
+        if cfg.global_mapping == "random":
+            # old behavior
+            for _ in range(cfg.global_links_per_group_pair):
+                a = rnd.choice(sw_a)
+                b = rnd.choice(sw_b)
+                G.add_edge(a, b, kind="global")
+        else:
+            # round-robin deterministic mapping (reduces crossings)
+            # pick switch indices based on group ids and link index
             for k in range(cfg.global_links_per_group_pair):
-                a = rnd.choice(switches_a)
-                b = rnd.choice(switches_b)
+                ia = (gid_a + gid_b + k) % len(sw_a)
+                ib = (gid_a * 3 + gid_b + k) % len(sw_b)
+                a = sw_a[ia]
+                b = sw_b[ib]
                 G.add_edge(a, b, kind="global")
 
     return G
@@ -348,13 +392,22 @@ if __name__ == "__main__":
         compute_groups=6,
         storage_groups=1,
         service_groups=1,
-        switches_per_group=8,
-        compute_nodes_per_switch=1,
+        switches_per_group=32,
+        compute_nodes_per_switch=2,
         global_links_per_group_pair=2,
         intra_group="clique",
         metric_scope="switches",
         show_labels=False
     )
+
+    # cfg = TopologyConfig(
+    #     compute_groups=6,
+    #     switches_per_group=8,
+    #     compute_nodes_per_switch=1,
+    #     global_mode="aurora",
+    #     global_mapping="round_robin",
+    #     global_links_per_group_pair=2
+    # )
 
     G = generate_aurora_like(cfg)
     pos = hierarchical_positions(G, cfg)
