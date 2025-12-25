@@ -16,18 +16,18 @@ from matplotlib.patches import FancyArrowPatch
 class TopologyConfig:
     groups: int = 6
 
-    subgroups_per_group: int = 4          # chassis per group
-    compute_nodes_per_subgroup: int = 8   # endpoints per subgroup
+    subgroups_per_group: int = 4  # chassis per group
+    compute_nodes_per_subgroup: int = 8  # endpoints per subgroup
 
-    switches_per_subgroup: int = 4        # FIXED (keep 4)
-    ports_per_switch: int = 28            # configurable “links per switch”
+    switches_per_subgroup: int = 4  # FIXED (keep 4)
+    ports_per_switch: int = 28  # configurable “links per switch”
 
-    min_links_per_group_pair: int = 2     # MUST be satisfied for every pair
+    min_links_per_group_pair: int = 2  # MUST be satisfied for every pair
 
     seed: int = 42
 
     # Metrics (optional)
-    metric_scope: str = "switches"        # "switches" or "all"
+    metric_scope: str = "switches"  # "switches" or "all"
     sample_pairs: int = 4000
 
     # Draw
@@ -123,11 +123,11 @@ def generate_dragonfly(cfg: TopologyConfig) -> nx.MultiGraph:
     if over:
         worst = sorted(over, key=lambda x: x[1], reverse=True)[:8]
         msg = (
-            "Config error: local wiring already exceeds ports_per_switch.\n"
-            f"ports_per_switch={cfg.ports_per_switch}, "
-            f"groups={cfg.groups}, subgroups_per_group={cfg.subgroups_per_group}, "
-            f"compute_nodes_per_subgroup={cfg.compute_nodes_per_subgroup}\n"
-            "Worst switches:\n" + "\n".join([f"  {n}: used {u}" for n, u in worst])
+                "Config error: local wiring already exceeds ports_per_switch.\n"
+                f"ports_per_switch={cfg.ports_per_switch}, "
+                f"groups={cfg.groups}, subgroups_per_group={cfg.subgroups_per_group}, "
+                f"compute_nodes_per_subgroup={cfg.compute_nodes_per_subgroup}\n"
+                "Worst switches:\n" + "\n".join([f"  {n}: used {u}" for n, u in worst])
         )
         raise TopologyConfigError(msg)
 
@@ -321,6 +321,7 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos: Dict[str, Tuple[float, flo
             def ang(s):
                 x, y = pos[s]
                 return math.atan2(y - cy0, x - cx0)
+
             sw_list.sort(key=ang)
             for i, s in enumerate(sw_list):
                 switch_order[s] = i
@@ -407,15 +408,128 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos: Dict[str, Tuple[float, flo
     # --- nodes on top ---
     ax.scatter([pos[n][0] for n in switches], [pos[n][1] for n in switches],
                s=cfg.node_size_switch, c="tab:green",
-               edgecolors="black", linewidths=0.8, zorder=10, label="Switches")
+               edgecolors="black", linewidths=0.8, zorder=10, label="Комутатори")
 
     ax.scatter([pos[n][0] for n in compute_nodes], [pos[n][1] for n in compute_nodes],
                s=cfg.node_size_compute, c="tab:blue",
-               edgecolors="black", linewidths=0.5, zorder=10, label="Compute nodes")
+               edgecolors="black", linewidths=0.5, zorder=10, label="Обчислювальні вузли")
 
     plt.tight_layout()
     plt.legend(scatterpoints=1, frameon=False, loc="upper left")
     plt.show()
+
+
+import random
+import networkx as nx
+
+
+def compute_metrics_ua(G: nx.MultiGraph, cfg, scope: str = "switches") -> dict:
+    """
+    scope:
+      - "switches": метрики тільки по комутаторах (рекомендовано)
+      - "all": по всіх вузлах (комутатори + compute)
+    """
+    if scope == "switches":
+        nodes = [n for n, d in G.nodes(data=True) if d.get("kind") == "switch"]
+        H = nx.Graph(G.subgraph(nodes))  # простий граф
+    else:
+        H = nx.Graph(G)
+
+    N = H.number_of_nodes()
+    E = H.number_of_edges()
+
+    if N == 0:
+        return {
+            "N": 0, "S_max": 0, "S_сер": 0,
+            "D": 0, "D*": 0, "Q": 0,
+            "C_лінки": 0, "C_порти": 0,
+            "компонента": 0
+        }
+
+    degrees = [deg for _, deg in H.degree()]
+    S_max = max(degrees) if degrees else 0
+    S_avg = (sum(degrees) / len(degrees)) if degrees else 0.0
+
+    # якщо граф не зв'язний — беремо найбільшу зв'язну компоненту для D, D*, Q
+    if not nx.is_connected(H):
+        largest = max(nx.connected_components(H), key=len)
+        Hc = H.subgraph(largest).copy()
+    else:
+        Hc = H
+
+    Nc = Hc.number_of_nodes()
+
+    # D
+    if Nc <= 800:
+        D = nx.diameter(Hc)
+    else:
+        # наближення (5 стартів BFS)
+        rnd = random.Random(getattr(cfg, "seed", 42))
+        starts = [rnd.choice(list(Hc.nodes())) for _ in range(5)]
+        best = 0
+        for s in starts:
+            lengths = nx.single_source_shortest_path_length(Hc, s)
+            best = max(best, max(lengths.values()))
+        D = best
+
+    # D* та Q
+    if Nc <= 500:
+        D_star = nx.average_shortest_path_length(Hc)
+        Q = 0
+        for u in Hc.nodes():
+            lengths = nx.single_source_shortest_path_length(Hc, u)
+            Q += sum(lengths.values())
+        Q = Q / 2  # бо порахували кожну пару двічі
+    else:
+        rnd = random.Random(getattr(cfg, "seed", 42))
+        nodes_list = list(Hc.nodes())
+        target = min(getattr(cfg, "sample_pairs", 4000), Nc * (Nc - 1) // 2)
+
+        pairs = set()
+        while len(pairs) < target:
+            u = rnd.choice(nodes_list)
+            v = rnd.choice(nodes_list)
+            if u != v:
+                a, b = (u, v) if u < v else (v, u)
+                pairs.add((a, b))
+
+        total = 0
+        count = 0
+        for (u, v) in pairs:
+            try:
+                d = nx.shortest_path_length(Hc, u, v)
+                total += d
+                count += 1
+            except nx.NetworkXNoPath:
+                pass
+
+        D_star = (total / count) if count else 0.0
+        total_pairs = Nc * (Nc - 1) / 2
+        Q = D_star * total_pairs
+
+    C = D * N * S_max
+
+    return {
+        "N": int(N),
+        "S_max": float(S_max),
+        "S_сер": float(S_avg),
+        "D": float(D),
+        "D*": float(D_star),
+        "Q": float(Q),
+        "C": int(C)
+    }
+
+
+def print_metrics_ua(m: dict, scope: str):
+    print("\n=== МЕТРИКИ ТОПОЛОГІЇ ===")
+    print(
+        f"Область розрахунку: {'лише комутатори' if scope == 'switches' else 'усі вузли (комутатори+обчислювальні вузли)'}")
+    print(f"Кількість вузлів N: {m['N']}")
+    print(f"Ступінь топології S: {m['S_max']:.2f}")
+    print(f"Діаметр D: {m['D']:.2f}")
+    print(f"Середній діаметр D_сер: {m['D*']:.4f}")
+    print(f"Топологічний трафік Q: {m['Q']:.2f}")
+    print(f"Вартість C: {m['C']}")
 
 
 if __name__ == "__main__":
@@ -429,4 +543,9 @@ if __name__ == "__main__":
 
     G = generate_dragonfly(cfg)
     pos = dragonfly_ring_positions(G, cfg)
+
+    m = compute_metrics_ua(G, cfg, scope="all")
+    print_metrics_ua(m, scope="all")
+
     draw_topology_dragonflyish(G, pos, cfg)
+
