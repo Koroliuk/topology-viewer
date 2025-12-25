@@ -285,7 +285,6 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos: Dict[str, Tuple[float, flo
     # edge lists
     global_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "global"]
     group_intra = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "group_intra"]
-    subgroup_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "subgroup_intra"]
     local_extra = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "local_extra"]
     inj_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "inj"]
 
@@ -335,8 +334,8 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos: Dict[str, Tuple[float, flo
                 connectionstyle=f"arc3,rad={-rad}",
                 arrowstyle="-",
                 lw=0.7,
-                color="red",
-                alpha=0.14,
+                color="black",
+                alpha=0.65,
                 zorder=0.3
             ))
 
@@ -359,8 +358,8 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos: Dict[str, Tuple[float, flo
                     connectionstyle=f"arc3,rad={rad}",
                     arrowstyle="-",
                     lw=2.4,
-                    color="tab:blue",
-                    alpha=0.85,
+                    color="black",
+                    alpha=0.65,
                     zorder=1.0
                 ))
 
@@ -380,7 +379,7 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos: Dict[str, Tuple[float, flo
             x1, y1 = pos[s2];
             x2, y2 = pos[s3]
             ax.plot([x1, x2], [y1, y2],
-                    color="tab:blue", alpha=0.55, lw=1.2, zorder=1.2)
+                    color="black", alpha=0.55, lw=1.2, zorder=1.2)
 
             # Other clique edges as curvy (inner side)
             for (u, v, mag) in [
@@ -396,14 +395,14 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos: Dict[str, Tuple[float, flo
                     connectionstyle=f"arc3,rad={-rad}",
                     arrowstyle="-",
                     lw=1.2,
-                    color="tab:blue",
+                    color="black",
                     alpha=0.50,
                     zorder=1.2
                 ))
 
     # --- injection edges (grey) ---
     if inj_edges:
-        nx.draw_networkx_edges(nx.Graph(inj_edges), pos, alpha=0.45, width=1.6, edge_color="gray")
+        nx.draw_networkx_edges(nx.Graph(inj_edges), pos, alpha=0.45, width=1.6, edge_color="black")
 
     # --- nodes on top ---
     ax.scatter([pos[n][0] for n in switches], [pos[n][1] for n in switches],
