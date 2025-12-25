@@ -1,3 +1,6 @@
+from matplotlib.patches import Ellipse, FancyArrowPatch
+import numpy as np
+
 import math
 import random
 from dataclasses import dataclass
@@ -13,41 +16,36 @@ class TopologyConfig:
     storage_groups: int = 1
     service_groups: int = 1
 
-    switches_per_group: int = 8          # Aurora: 32 (too big for drawing)
-    compute_nodes_per_switch: int = 1    # Aurora has many endpoints; keep small for draw
+    chassis_per_group: int = 8          # 8 subgroups
+    switches_per_chassis: int = 4       # 4 switches per subgroup
+    compute_nodes_per_chassis: int = 8  # 8 nodes per subgroup (your model)
 
-    # In Aurora compute<->compute: 2 global links between each pair of compute groups
     global_links_per_group_pair: int = 2
 
-    # Intra-group wiring: Aurora is all-to-all among 32 switches (clique)
-    intra_group: str = "clique"          # "clique" or "dense"
-    dense_p: float = 0.6                 # used if intra_group == "dense"
-
+    intra_group: str = "clique"  # keep for metrics, but we won't draw all those edges
     seed: int = 42
-
-    # Metrics
-    metric_scope: str = "switches"       # "switches" or "all"
-    sample_pairs: int = 5000             # for D*, Q when graph is large
 
     # Draw
     figsize: Tuple[int, int] = (14, 10)
-    node_size_switch: int = 220
-    node_size_compute: int = 60
+    node_size_switch: int = 90
+    node_size_compute: int = 18
     show_labels: bool = False
 
-    # Global wiring style
-    global_mode: str = "aurora"          # "aurora" (all-to-all) or "sparse"
-    sparse_group_degree: int = 3         # used if global_mode == "sparse" (neighbors on ring)
+    # Ring layout knobs
+    ring_radius: float = 12.0
+    group_gap_angle: float = 0.10  # radians, space between group segments
+    node_radius_offset: float = 1.2
 
-    global_mapping: str = "round_robin"  # "round_robin" or "random"
-
+    @property
+    def switches_per_group(self) -> int:
+        return self.chassis_per_group * self.switches_per_chassis
 
 
 def generate_aurora_like(cfg: TopologyConfig) -> nx.MultiGraph:
     rnd = random.Random(cfg.seed)
     G = nx.MultiGraph()
 
-    # Group types: compute groups first, then storage, then service
+    # Group types list
     groups: List[Tuple[str, int]] = []
     for gi in range(cfg.compute_groups):
         groups.append(("compute", gi))
@@ -56,97 +54,74 @@ def generate_aurora_like(cfg: TopologyConfig) -> nx.MultiGraph:
     for vi in range(cfg.service_groups):
         groups.append(("service", cfg.compute_groups + cfg.storage_groups + vi))
 
-    # Create switches + compute nodes inside each group
+    # Create chassis -> switches + compute nodes
     for gtype, gid in groups:
-        switch_ids = []
-        for s in range(cfg.switches_per_group):
-            sid = f"g{gid}_s{s}"
-            G.add_node(
-                sid,
-                kind="switch",
-                group=gid,
-                group_type=gtype,
-                label=sid
-            )
-            switch_ids.append(sid)
+        switches_in_group: List[str] = []
 
-            # attach compute nodes to each switch (small for demo)
-            for c in range(cfg.compute_nodes_per_switch):
-                nid = f"{sid}_n{c}"
+        for c in range(cfg.chassis_per_group):
+            chassis_switches: List[str] = []
+
+            # 4 switches per chassis
+            for s in range(cfg.switches_per_chassis):
+                sid = f"g{gid}_c{c}_s{s}"
+                G.add_node(
+                    sid,
+                    kind="switch",
+                    group=gid,
+                    group_type=gtype,
+                    chassis=c,
+                    switch_in_chassis=s,
+                    label=sid
+                )
+                chassis_switches.append(sid)
+                switches_in_group.append(sid)
+
+            # 8 compute nodes per chassis
+            for n in range(cfg.compute_nodes_per_chassis):
+                nid = f"g{gid}_c{c}_n{n}"
                 G.add_node(
                     nid,
                     kind="compute",
                     group=gid,
                     group_type=gtype,
+                    chassis=c,
                     label=nid
                 )
-                G.add_edge(sid, nid, kind="inj")
+                # Connect node to ALL switches of chassis (clear demo model)
+                for sid in chassis_switches:
+                    G.add_edge(sid, nid, kind="inj")
 
-        # Intra-group switch wiring
+            # Optional: local chassis wiring (symbolic, not critical)
+            # connect switches in chassis in a small chain/ring
+            for i in range(len(chassis_switches) - 1):
+                G.add_edge(chassis_switches[i], chassis_switches[i + 1], kind="local_chassis")
+
+        # Intra-group dense wiring (for metrics realism)
         if cfg.intra_group == "clique":
-            for i in range(len(switch_ids)):
-                for j in range(i + 1, len(switch_ids)):
-                    G.add_edge(switch_ids[i], switch_ids[j], kind="intra")
-        else:
-            # dense random
-            for i in range(len(switch_ids)):
-                for j in range(i + 1, len(switch_ids)):
-                    if rnd.random() < cfg.dense_p:
-                        G.add_edge(switch_ids[i], switch_ids[j], kind="intra")
+            for i in range(len(switches_in_group)):
+                for j in range(i + 1, len(switches_in_group)):
+                    G.add_edge(switches_in_group[i], switches_in_group[j], kind="intra")
 
-    # --- Global links: compute groups connectivity ---
+    # Global links between compute groups (keep your round-robin deterministic mapping)
     compute_group_ids = list(range(cfg.compute_groups))
 
-    def switches_in_group(gid: int) -> List[str]:
-        return [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d["group"] == gid]
-
-    # Precompute deterministic ordering of switches by index in name g{gid}_s{idx}
     def ordered_switches(gid: int) -> List[str]:
-        sw = switches_in_group(gid)
-        # sort by the integer after "_s"
-        sw.sort(key=lambda x: int(x.split("_s")[1]))
+        sw = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d["group"] == gid]
+        # order by chassis then switch index
+        sw.sort(key=lambda x: (G.nodes[x].get("chassis", 0), G.nodes[x].get("switch_in_chassis", 0)))
         return sw
 
-    # Choose which group pairs to connect depending on mode
-    group_pairs: List[Tuple[int, int]] = []
+    for i in range(len(compute_group_ids)):
+        for j in range(i + 1, len(compute_group_ids)):
+            ga = compute_group_ids[i]
+            gb = compute_group_ids[j]
+            sw_a = ordered_switches(ga)
+            sw_b = ordered_switches(gb)
 
-    if cfg.global_mode == "aurora":
-        # all-to-all pairs
-        for i in range(len(compute_group_ids)):
-            for j in range(i + 1, len(compute_group_ids)):
-                group_pairs.append((compute_group_ids[i], compute_group_ids[j]))
-    else:
-        # sparse ring: each group connects to next K groups (wrap-around)
-        K = max(1, cfg.sparse_group_degree)
-        for i in compute_group_ids:
-            for step in range(1, K + 1):
-                j = (i + step) % cfg.compute_groups
-                if i < j:
-                    group_pairs.append((i, j))
-                else:
-                    # ensure uniqueness
-                    group_pairs.append((j, i))
-        group_pairs = sorted(set(group_pairs))
-
-    for gid_a, gid_b in group_pairs:
-        sw_a = ordered_switches(gid_a)
-        sw_b = ordered_switches(gid_b)
-
-        if cfg.global_mapping == "random":
-            # old behavior
-            for _ in range(cfg.global_links_per_group_pair):
-                a = rnd.choice(sw_a)
-                b = rnd.choice(sw_b)
-                G.add_edge(a, b, kind="global")
-        else:
-            # round-robin deterministic mapping (reduces crossings)
-            # pick switch indices based on group ids and link index
             for k in range(cfg.global_links_per_group_pair):
-                ia = (gid_a + gid_b + k) % len(sw_a)
-                ib = (gid_a * 3 + gid_b + k) % len(sw_b)
-                a = sw_a[ia]
-                b = sw_b[ib]
-                G.add_edge(a, b, kind="global")
+                ia = (ga + gb + k) % len(sw_a)
+                ib = (ga * 3 + gb + k) % len(sw_b)
+                G.add_edge(sw_a[ia], sw_b[ib], kind="global")
 
     return G
 
@@ -290,62 +265,78 @@ def compute_metrics(G: nx.MultiGraph, cfg: TopologyConfig) -> Dict[str, float]:
         "connected_component_size": float(Nc),
     }
 
+from matplotlib.patches import FancyArrowPatch
 
-def draw_topology(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> None:
+from matplotlib.patches import FancyArrowPatch
+
+def draw_topology_dragonflyish(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> None:
     plt.figure(figsize=cfg.figsize)
+    ax = plt.gca()
+    ax.axis("off")
 
-    # Separate nodes by kind
-    switches = [n for n, d in G.nodes(data=True) if d["kind"] == "switch"]
-    computes = [n for n, d in G.nodes(data=True) if d["kind"] == "compute"]
+    # --- edges by type ---
+    global_edges = [(u, v) for u, v, d in G.edges(data=True)
+                    if d.get("kind") in ("global", "global_storage", "global_service")]
 
-    # Separate edges by kind (as stored in generate_aurora_like)
-    intra_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "intra"]
-    global_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "global"]
     inj_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "inj"]
 
-    # --- Edges styling by type ---
-    # Intra-group: light + thin
-    if intra_edges:
-        nx.draw_networkx_edges(
-            nx.Graph(intra_edges),
-            pos,
-            alpha=0.12,
-            width=0.6,
-        )
+    local_chassis = [(u, v) for u, v, d in G.edges(data=True)
+                     if d.get("kind") in ("local_chassis",)]
 
-    # Global: darker + thicker
+    # Global: black chords (between groups)
     if global_edges:
         nx.draw_networkx_edges(
             nx.Graph(global_edges),
             pos,
-            alpha=0.45,
+            alpha=0.75,
             width=1.8,
+            edge_color="black",
         )
 
-    # Injection: very faint + very thin
+    # Local chassis: blue arcs (symbolic local links)
+    for (u, v) in local_chassis:
+        x1, y1 = pos[u]
+        x2, y2 = pos[v]
+        patch = FancyArrowPatch(
+            (x1, y1), (x2, y2),
+            connectionstyle="arc3,rad=0.25",
+            arrowstyle="-",
+            lw=1.4,
+            color="tab:blue",
+            alpha=0.70,
+            zorder=2,
+        )
+        ax.add_patch(patch)
+
+    # Injection: thicker and more visible (node <-> switch)
     if inj_edges:
         nx.draw_networkx_edges(
             nx.Graph(inj_edges),
             pos,
-            alpha=0.06,
-            width=0.4,
+            alpha=0.35,     # was ~0.06 before
+            width=1.2,      # thicker as requested
+            edge_color="gray",
         )
 
-    # --- Nodes styling by kind + group_type ---
-    switches_compute = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d.get("group_type") == "compute"]
-    switches_storage = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d.get("group_type") == "storage"]
-    switches_service = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d.get("group_type") == "service"]
+    # --- nodes by type + group_type ---
+    switches_compute = [n for n, d in G.nodes(data=True)
+                        if d.get("kind") == "switch" and d.get("group_type") == "compute"]
+    switches_storage = [n for n, d in G.nodes(data=True)
+                        if d.get("kind") == "switch" and d.get("group_type") == "storage"]
+    switches_service = [n for n, d in G.nodes(data=True)
+                        if d.get("kind") == "switch" and d.get("group_type") == "service"]
 
-    compute_endpoints = [n for n, d in G.nodes(data=True) if d["kind"] == "compute"]
+    compute_nodes = [n for n, d in G.nodes(data=True) if d.get("kind") == "compute"]
 
-    # Switches by group type
+    # Switches as squares (colored)
     nx.draw_networkx_nodes(
         G, pos,
         nodelist=switches_compute,
         node_size=cfg.node_size_switch,
-        node_color="tab:blue",
-        linewidths=0.6,
-        edgecolors="white",
+        node_color="tab:green",
+        edgecolors="black",
+        linewidths=0.8,
+        node_shape="s",
         label="Compute switches"
     )
     nx.draw_networkx_nodes(
@@ -353,8 +344,9 @@ def draw_topology(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> None:
         nodelist=switches_storage,
         node_size=cfg.node_size_switch,
         node_color="tab:orange",
-        linewidths=0.6,
-        edgecolors="white",
+        edgecolors="black",
+        linewidths=0.8,
+        node_shape="s",
         label="Storage switches"
     )
     nx.draw_networkx_nodes(
@@ -362,41 +354,117 @@ def draw_topology(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> None:
         nodelist=switches_service,
         node_size=cfg.node_size_switch,
         node_color="tab:purple",
-        linewidths=0.6,
-        edgecolors="white",
+        edgecolors="black",
+        linewidths=0.8,
+        node_shape="s",
         label="Service switches"
     )
 
-    # Endpoints (compute nodes)
+    # Compute nodes as blue circles
     nx.draw_networkx_nodes(
         G, pos,
-        nodelist=compute_endpoints,
+        nodelist=compute_nodes,
         node_size=cfg.node_size_compute,
-        node_color="lightgrey",
-        linewidths=0.0,
+        node_color="tab:blue",
+        edgecolors="black",
+        linewidths=0.5,
+        node_shape="o",
         label="Compute nodes"
     )
 
-    if cfg.show_labels:
-        labels = {n: G.nodes[n].get("label", n) for n in G.nodes()}
-        nx.draw_networkx_labels(G, pos, labels=labels, font_size=6)
-
-    plt.axis("off")
     plt.tight_layout()
     plt.legend(scatterpoints=1, frameon=False, loc="upper left")
     plt.show()
 
 
+
+def dragonfly_ring_positions(G: nx.MultiGraph, cfg: TopologyConfig) -> Dict[str, Tuple[float, float]]:
+    # Order switches by group -> chassis -> switch
+    switches = [n for n, d in G.nodes(data=True) if d["kind"] == "switch"]
+    switches.sort(key=lambda x: (G.nodes[x]["group"], G.nodes[x].get("chassis", 0), G.nodes[x].get("switch_in_chassis", 0)))
+
+    groups = sorted({G.nodes[s]["group"] for s in switches})
+    group_to_switches: Dict[int, List[str]] = {g: [] for g in groups}
+    for s in switches:
+        group_to_switches[G.nodes[s]["group"]].append(s)
+
+    total_groups = len(groups)
+    pos: Dict[str, Tuple[float, float]] = {}
+
+    # total angle budget = 2π minus gaps
+    gaps_total = total_groups * cfg.group_gap_angle
+    usable_angle = 2 * math.pi - gaps_total
+    # each group gets equal angular span proportional to its #switches
+    total_switches = sum(len(group_to_switches[g]) for g in groups)
+    angle_per_switch = usable_angle / max(1, total_switches)
+
+    theta = 0.0
+    R = cfg.ring_radius
+
+    # place switches group by group
+    for g in groups:
+        theta += cfg.group_gap_angle / 2  # half-gap before group
+        sw_list = group_to_switches[g]
+
+        for s in sw_list:
+            x = R * math.cos(theta)
+            y = R * math.sin(theta)
+            pos[s] = (x, y)
+            theta += angle_per_switch
+
+        theta += cfg.group_gap_angle / 2  # half-gap after group
+
+    # place compute nodes behind their chassis (slightly outside, near chassis center angle)
+    computes = [n for n, d in G.nodes(data=True) if d["kind"] == "compute"]
+    for n in computes:
+        gid = G.nodes[n]["group"]
+        chassis = G.nodes[n].get("chassis", 0)
+
+        # find the 4 switches of this chassis
+        chassis_switches = [
+            s for s in group_to_switches[gid]
+            if G.nodes[s].get("chassis", -1) == chassis
+        ]
+        if not chassis_switches:
+            continue
+
+        # chassis center = average of its 4 switch positions
+        cx = sum(pos[s][0] for s in chassis_switches) / len(chassis_switches)
+        cy = sum(pos[s][1] for s in chassis_switches) / len(chassis_switches)
+
+        # radial outward direction
+        norm = math.hypot(cx, cy) or 1.0
+        ux, uy = (cx / norm, cy / norm)
+
+        # small lateral offset so nodes don't overlap completely
+        # (use node index from name gX_cY_nZ)
+        nz = int(n.split("_n")[1])
+        lateral = (nz - (cfg.compute_nodes_per_chassis - 1) / 2) * 0.15
+        px, py = (-uy, ux)  # perpendicular
+
+        pos[n] = (
+            cx + ux * cfg.node_radius_offset + px * lateral,
+            cy + uy * cfg.node_radius_offset + py * lateral
+        )
+
+    return pos
+
+
+
 if __name__ == "__main__":
     cfg = TopologyConfig(
         compute_groups=6,
-        storage_groups=1,
-        service_groups=1,
-        switches_per_group=32,
-        compute_nodes_per_switch=2,
+        storage_groups=0,
+        service_groups=0,
+
+        chassis_per_group=4,
+        switches_per_chassis=4,
+        compute_nodes_per_chassis=8,
+
         global_links_per_group_pair=2,
         intra_group="clique",
-        metric_scope="switches",
+        seed=42,
+
         show_labels=False
     )
 
@@ -410,11 +478,6 @@ if __name__ == "__main__":
     # )
 
     G = generate_aurora_like(cfg)
-    pos = hierarchical_positions(G, cfg)
-    metrics = compute_metrics(G, cfg)
+    pos = dragonfly_ring_positions(G, cfg)
+    draw_topology_dragonflyish(G, pos, cfg)
 
-    print("=== Metrics ===")
-    for k, v in metrics.items():
-        print(f"{k:>24}: {v}")
-
-    draw_topology(G, pos, cfg)
