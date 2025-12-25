@@ -247,26 +247,91 @@ def compute_metrics(G: nx.MultiGraph, cfg: TopologyConfig) -> Dict[str, float]:
     }
 
 
-def draw_topology(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cfg: TopologyConfig) -> None:
+def draw_topology(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> None:
     plt.figure(figsize=cfg.figsize)
 
     # Separate nodes by kind
     switches = [n for n, d in G.nodes(data=True) if d["kind"] == "switch"]
     computes = [n for n, d in G.nodes(data=True) if d["kind"] == "compute"]
 
-    # Separate edges by kind
-    intra = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "intra"]
-    global_e = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "global"]
-    inj = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "inj"]
+    # Separate edges by kind (as stored in generate_aurora_like)
+    intra_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "intra"]
+    global_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "global"]
+    inj_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "inj"]
 
-    # Draw edges (order matters)
-    nx.draw_networkx_edges(nx.Graph(intra), pos, alpha=0.25, width=0.8)
-    nx.draw_networkx_edges(nx.Graph(global_e), pos, alpha=0.35, width=1.2)
-    nx.draw_networkx_edges(nx.Graph(inj), pos, alpha=0.25, width=0.6)
+    # --- Edges styling by type ---
+    # Intra-group: light + thin
+    if intra_edges:
+        nx.draw_networkx_edges(
+            nx.Graph(intra_edges),
+            pos,
+            alpha=0.12,
+            width=0.6,
+        )
 
-    # Draw nodes
-    nx.draw_networkx_nodes(G, pos, nodelist=switches, node_size=cfg.node_size_switch)
-    nx.draw_networkx_nodes(G, pos, nodelist=computes, node_size=cfg.node_size_compute)
+    # Global: darker + thicker
+    if global_edges:
+        nx.draw_networkx_edges(
+            nx.Graph(global_edges),
+            pos,
+            alpha=0.45,
+            width=1.8,
+        )
+
+    # Injection: very faint + very thin
+    if inj_edges:
+        nx.draw_networkx_edges(
+            nx.Graph(inj_edges),
+            pos,
+            alpha=0.06,
+            width=0.4,
+        )
+
+    # --- Nodes styling by kind + group_type ---
+    switches_compute = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d.get("group_type") == "compute"]
+    switches_storage = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d.get("group_type") == "storage"]
+    switches_service = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d.get("group_type") == "service"]
+
+    compute_endpoints = [n for n, d in G.nodes(data=True) if d["kind"] == "compute"]
+
+    # Switches by group type
+    nx.draw_networkx_nodes(
+        G, pos,
+        nodelist=switches_compute,
+        node_size=cfg.node_size_switch,
+        node_color="tab:blue",
+        linewidths=0.6,
+        edgecolors="white",
+        label="Compute switches"
+    )
+    nx.draw_networkx_nodes(
+        G, pos,
+        nodelist=switches_storage,
+        node_size=cfg.node_size_switch,
+        node_color="tab:orange",
+        linewidths=0.6,
+        edgecolors="white",
+        label="Storage switches"
+    )
+    nx.draw_networkx_nodes(
+        G, pos,
+        nodelist=switches_service,
+        node_size=cfg.node_size_switch,
+        node_color="tab:purple",
+        linewidths=0.6,
+        edgecolors="white",
+        label="Service switches"
+    )
+
+    # Endpoints (compute nodes)
+    nx.draw_networkx_nodes(
+        G, pos,
+        nodelist=compute_endpoints,
+        node_size=cfg.node_size_compute,
+        node_color="lightgrey",
+        linewidths=0.0,
+        label="Compute nodes"
+    )
 
     if cfg.show_labels:
         labels = {n: G.nodes[n].get("label", n) for n in G.nodes()}
@@ -274,6 +339,7 @@ def draw_topology(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cfg: To
 
     plt.axis("off")
     plt.tight_layout()
+    plt.legend(scatterpoints=1, frameon=False, loc="upper left")
     plt.show()
 
 
