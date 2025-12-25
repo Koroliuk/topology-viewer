@@ -367,14 +367,29 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> No
     group_intra = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "group_intra"]
 
     # --- draw global first ---
+    # Curvy global links: draw as arcs bending away from compute nodes (into empty side)
     if global_edges:
-        nx.draw_networkx_edges(
-            nx.Graph(global_edges),
-            pos,
-            alpha=0.80,
-            width=2.0,
-            edge_color="black"
-        )
+        # group multiple parallel edges between same pair so we can spread curvature
+        pair_counts = Counter()
+        for u, v in global_edges:
+            a, b = (u, v) if u < v else (v, u)
+            pair_counts[(a, b)] += 1
+
+        for (u, v), cnt in pair_counts.items():
+            # make multiple arcs with increasing curvature, same "inner" side
+            for i in range(cnt):
+                mag = 0.18 + 0.06 * min(i, 6)  # more parallel links => more separated arcs
+                rad = rad_away_from_compute(u, v, mag)  # inner side (away from compute nodes)
+                patch = FancyArrowPatch(
+                    posA=pos[u], posB=pos[v],
+                    connectionstyle=f"arc3,rad={rad}",
+                    arrowstyle="-",
+                    lw=1.8,
+                    color="black",
+                    alpha=0.70,
+                    zorder=0.2
+                )
+                ax.add_patch(patch)
 
     # --- draw subgroup internal edges (per chassis) ---
     chassis_keys = sorted({
