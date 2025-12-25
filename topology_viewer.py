@@ -1,22 +1,13 @@
-import math
 import random
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
 
-import matplotlib.pyplot as plt
 import networkx as nx
-from matplotlib.patches import FancyArrowPatch
-
-import math
-from matplotlib.patches import FancyArrowPatch
-from collections import Counter
 
 
 @dataclass
 class TopologyConfig:
     compute_groups: int = 6
-    storage_groups: int = 1
-    service_groups: int = 1
 
     chassis_per_group: int = 8          # 8 subgroups
     switches_per_chassis: int = 4       # 4 switches per subgroup
@@ -42,6 +33,9 @@ class TopologyConfig:
     def switches_per_group(self) -> int:
         return self.chassis_per_group * self.switches_per_chassis
 
+    global_mode: str = "round_robin"  # "all_to_all" or "round_robin"
+    global_k: int = 2  # number of neighbor groups to connect to (per group)
+
 
 def generate_aurora_like(cfg: TopologyConfig) -> nx.MultiGraph:
     rnd = random.Random(cfg.seed)
@@ -51,10 +45,6 @@ def generate_aurora_like(cfg: TopologyConfig) -> nx.MultiGraph:
     groups: List[Tuple[str, int]] = []
     for gi in range(cfg.compute_groups):
         groups.append(("compute", gi))
-    for si in range(cfg.storage_groups):
-        groups.append(("storage", cfg.compute_groups + si))
-    for vi in range(cfg.service_groups):
-        groups.append(("service", cfg.compute_groups + cfg.storage_groups + vi))
 
     # Create chassis -> switches + compute nodes
     for gtype, gid in groups:
@@ -108,6 +98,20 @@ def generate_aurora_like(cfg: TopologyConfig) -> nx.MultiGraph:
                 G.add_edge(s3, s4, kind="local_extra")
                 G.add_edge(s3, s4, kind="local_extra")
 
+        # --- Intra-group links across chassis (group-level all-to-all) ---
+        # We connect switches from different chassis. Within-chassis all-to-all is already modeled by local_clique.
+        group_switches = [n for n, d in G.nodes(data=True)
+                          if d.get("kind") == "switch" and d.get("group") == gid and "chassis" in d]
+
+        group_switches.sort(key=lambda n: (G.nodes[n].get("chassis", 0), G.nodes[n].get("switch_in_chassis", 0)))
+
+        for i in range(len(group_switches)):
+            for j in range(i + 1, len(group_switches)):
+                a, b = group_switches[i], group_switches[j]
+                if G.nodes[a].get("chassis") != G.nodes[b].get("chassis"):
+                    G.add_edge(a, b, kind="group_intra")
+
+
         # Intra-group dense wiring (for metrics realism)
         if cfg.intra_group == "clique":
             for i in range(len(switches_in_group)):
@@ -115,25 +119,39 @@ def generate_aurora_like(cfg: TopologyConfig) -> nx.MultiGraph:
                     G.add_edge(switches_in_group[i], switches_in_group[j], kind="intra")
 
     # Global links between compute groups (keep your round-robin deterministic mapping)
-    compute_group_ids = list(range(cfg.compute_groups))
+    # ---- Global links between compute groups ----
+    G_ids = list(range(cfg.compute_groups))
 
     def ordered_switches(gid: int) -> List[str]:
         sw = [n for n, d in G.nodes(data=True) if d["kind"] == "switch" and d["group"] == gid]
-        # order by chassis then switch index
         sw.sort(key=lambda x: (G.nodes[x].get("chassis", 0), G.nodes[x].get("switch_in_chassis", 0)))
         return sw
 
-    for i in range(len(compute_group_ids)):
-        for j in range(i + 1, len(compute_group_ids)):
-            ga = compute_group_ids[i]
-            gb = compute_group_ids[j]
-            sw_a = ordered_switches(ga)
-            sw_b = ordered_switches(gb)
+    added_pairs = set()
 
-            for k in range(cfg.global_links_per_group_pair):
-                ia = (ga + gb + k) % len(sw_a)
-                ib = (ga * 3 + gb + k) % len(sw_b)
-                G.add_edge(sw_a[ia], sw_b[ib], kind="global")
+    if cfg.global_mode == "all_to_all":
+        pairs = [(a, b) for i, a in enumerate(G_ids) for b in G_ids[i + 1:]]
+    else:
+        # round-robin neighbors on the ring
+        k = max(1, min(cfg.global_k, len(G_ids) // 2))
+        pairs = []
+        for a in G_ids:
+            for step in range(1, k + 1):
+                b = (a + step) % len(G_ids)
+                x, y = (a, b) if a < b else (b, a)
+                if (x, y) not in added_pairs:
+                    added_pairs.add((x, y))
+                    pairs.append((x, y))
+
+    # Add L parallel links per selected group pair, deterministically mapped to switches
+    for ga, gb in pairs:
+        sw_a = ordered_switches(ga)
+        sw_b = ordered_switches(gb)
+
+        for link_i in range(cfg.global_links_per_group_pair):
+            ia = (gb + link_i) % len(sw_a)
+            ib = (ga + 2 * link_i + 1) % len(sw_b)
+            G.add_edge(sw_a[ia], sw_b[ib], kind="global")
 
     return G
 
@@ -277,18 +295,6 @@ def compute_metrics(G: nx.MultiGraph, cfg: TopologyConfig) -> Dict[str, float]:
         "connected_component_size": float(Nc),
     }
 
-from collections import Counter
-
-from matplotlib.patches import FancyArrowPatch
-
-from matplotlib.patches import FancyArrowPatch
-import math
-from collections import Counter
-from matplotlib.patches import FancyArrowPatch
-import networkx as nx
-import matplotlib.pyplot as plt
-
-
 import math
 from collections import Counter
 from matplotlib.patches import FancyArrowPatch
@@ -354,11 +360,11 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> No
         return mag if (nx_ * inx + ny_ * iny) > 0 else -mag
 
     # --- edges by type ---
-    global_edges = [(u, v) for u, v, d in G.edges(data=True)
-                    if d.get("kind") in ("global", "global_storage", "global_service")]
+    global_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "global"]
     inj_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "inj"]
 
     local_extra = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "local_extra"]
+    group_intra = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "group_intra"]
 
     # --- draw global first ---
     if global_edges:
@@ -434,6 +440,53 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> No
             )
             ax.add_patch(patch)
 
+    # Intra-group all-to-all: very faint curved arcs (inner side, away from compute nodes)
+    # Intra-group all-to-all: draw as deeper inward arcs with varied curvature so they separate visually
+    if group_intra:
+        # Build an index of switch order within each group (along the ring)
+        group_switches_sorted = {}
+        switch_order = {}  # switch -> index within its group
+
+        # Collect switches by group and sort them in ring order using their angle
+        for n, d in G.nodes(data=True):
+            if d.get("kind") == "switch":
+                gid = d.get("group")
+                group_switches_sorted.setdefault(gid, []).append(n)
+
+        for gid, sw_list in group_switches_sorted.items():
+            # sort by polar angle around ring center
+            def angle(s):
+                x, y = pos[s]
+                return math.atan2(y - cy0, x - cx0)
+
+            sw_list.sort(key=angle)
+            for i, s in enumerate(sw_list):
+                switch_order[s] = i
+
+        # Draw arcs with curvature based on distance in ring order
+        for (u, v) in group_intra:
+            iu = switch_order.get(u, 0)
+            iv = switch_order.get(v, 0)
+            dist = abs(iu - iv)
+
+            # Map distance to curvature:
+            # near neighbors -> small curve, far pairs -> deep curve
+            # tweak these constants to taste
+            mag = 0.18 + 0.03 * min(dist, 10)  # grows up to ~0.48
+
+            rad = rad_away_from_compute(u, v, mag)
+
+            patch = FancyArrowPatch(
+                posA=pos[u], posB=pos[v],
+                connectionstyle=f"arc3,rad={-rad}",
+                arrowstyle="-",
+                lw=0.7,
+                color="red",
+                alpha=0.16,
+                zorder=0.6
+            )
+            ax.add_patch(patch)
+
     # --- draw injection after local (so local doesn't sit on top of injection) ---
     if inj_edges:
         nx.draw_networkx_edges(
@@ -447,10 +500,6 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> No
     # --- nodes ---
     switches_compute = [n for n, d in G.nodes(data=True)
                         if d.get("kind") == "switch" and d.get("group_type") == "compute"]
-    switches_storage = [n for n, d in G.nodes(data=True)
-                        if d.get("kind") == "switch" and d.get("group_type") == "storage"]
-    switches_service = [n for n, d in G.nodes(data=True)
-                        if d.get("kind") == "switch" and d.get("group_type") == "service"]
     compute_nodes = [n for n, d in G.nodes(data=True) if d.get("kind") == "compute"]
 
     # draw nodes LAST so they are always on top
@@ -460,9 +509,7 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> No
         ax.scatter(xs, ys, s=size, c=color, edgecolors="black", linewidths=0.8,
                    zorder=10, label=label)
 
-    scatter(switches_compute, "tab:green", cfg.node_size_switch, "Compute switches")
-    scatter(switches_storage, "tab:orange", cfg.node_size_switch, "Storage switches")
-    scatter(switches_service, "tab:purple", cfg.node_size_switch, "Service switches")
+    scatter(switches_compute, "tab:green", cfg.node_size_switch, "Switches")
 
     ax.scatter([pos[n][0] for n in compute_nodes],
                [pos[n][1] for n in compute_nodes],
@@ -551,9 +598,6 @@ def dragonfly_ring_positions(G: nx.MultiGraph, cfg: TopologyConfig) -> Dict[str,
 if __name__ == "__main__":
     cfg = TopologyConfig(
         compute_groups=6,
-        storage_groups=0,
-        service_groups=0,
-
         chassis_per_group=4,
         switches_per_chassis=4,
         compute_nodes_per_chassis=8,
@@ -564,15 +608,6 @@ if __name__ == "__main__":
 
         show_labels=False
     )
-
-    # cfg = TopologyConfig(
-    #     compute_groups=6,
-    #     switches_per_group=8,
-    #     compute_nodes_per_switch=1,
-    #     global_mode="aurora",
-    #     global_mapping="round_robin",
-    #     global_links_per_group_pair=2
-    # )
 
     G = generate_aurora_like(cfg)
     pos = dragonfly_ring_positions(G, cfg)
