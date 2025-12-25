@@ -1,13 +1,15 @@
-from matplotlib.patches import Ellipse, FancyArrowPatch
-import numpy as np
-
 import math
 import random
 from dataclasses import dataclass
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List
 
-import networkx as nx
 import matplotlib.pyplot as plt
+import networkx as nx
+from matplotlib.patches import FancyArrowPatch
+
+import math
+from matplotlib.patches import FancyArrowPatch
+from collections import Counter
 
 
 @dataclass
@@ -27,8 +29,8 @@ class TopologyConfig:
 
     # Draw
     figsize: Tuple[int, int] = (14, 10)
-    node_size_switch: int = 90
-    node_size_compute: int = 18
+    node_size_switch: int = 120
+    node_size_compute: int = 120
     show_labels: bool = False
 
     # Ring layout knobs
@@ -91,10 +93,20 @@ def generate_aurora_like(cfg: TopologyConfig) -> nx.MultiGraph:
                 for sid in chassis_switches:
                     G.add_edge(sid, nid, kind="inj")
 
-            # Optional: local chassis wiring (symbolic, not critical)
-            # connect switches in chassis in a small chain/ring
-            for i in range(len(chassis_switches) - 1):
-                G.add_edge(chassis_switches[i], chassis_switches[i + 1], kind="local_chassis")
+            # --- Subgroup (chassis) switch wiring you described ---
+            # Switches S1..S4 form a clique: each connected to each other
+            for i in range(len(chassis_switches)):
+                for j in range(i + 1, len(chassis_switches)):
+                    G.add_edge(chassis_switches[i], chassis_switches[j], kind="local_clique")
+
+            # Additional (parallel) connections:
+            # extra links between S1-S2 and S3-S4 (two more edges each)
+            if len(chassis_switches) >= 4:
+                s1, s2, s3, s4 = chassis_switches[0], chassis_switches[1], chassis_switches[2], chassis_switches[3]
+                G.add_edge(s1, s2, kind="local_extra")
+                G.add_edge(s1, s2, kind="local_extra")
+                G.add_edge(s3, s4, kind="local_extra")
+                G.add_edge(s3, s4, kind="local_extra")
 
         # Intra-group dense wiring (for metrics realism)
         if cfg.intra_group == "clique":
@@ -265,117 +277,202 @@ def compute_metrics(G: nx.MultiGraph, cfg: TopologyConfig) -> Dict[str, float]:
         "connected_component_size": float(Nc),
     }
 
+from collections import Counter
+
 from matplotlib.patches import FancyArrowPatch
 
 from matplotlib.patches import FancyArrowPatch
+import math
+from collections import Counter
+from matplotlib.patches import FancyArrowPatch
+import networkx as nx
+import matplotlib.pyplot as plt
+
+
+import math
+from collections import Counter
+from matplotlib.patches import FancyArrowPatch
+import networkx as nx
+import matplotlib.pyplot as plt
+
 
 def draw_topology_dragonflyish(G: nx.MultiGraph, pos, cfg: TopologyConfig) -> None:
     plt.figure(figsize=cfg.figsize)
     ax = plt.gca()
     ax.axis("off")
 
+    # Precompute an "outward" direction for each switch: where its compute nodes are
+    switches = [n for n, d in G.nodes(data=True) if d.get("kind") == "switch"]
+    computes = [n for n, d in G.nodes(data=True) if d.get("kind") == "compute"]
+
+    # Center of the switch ring (fallback)
+    cx0 = sum(pos[n][0] for n in switches) / max(1, len(switches))
+    cy0 = sum(pos[n][1] for n in switches) / max(1, len(switches))
+
+    out_vec = {}  # switch -> (vx, vy) pointing toward compute nodes (outward)
+    for s in switches:
+        # compute neighbors of this switch
+        nbrs = []
+        for nbr in G.neighbors(s):
+            if G.nodes[nbr].get("kind") == "compute":
+                nbrs.append(nbr)
+
+        sx, sy = pos[s]
+
+        if nbrs:
+            vx = sum(pos[n][0] - sx for n in nbrs) / len(nbrs)
+            vy = sum(pos[n][1] - sy for n in nbrs) / len(nbrs)
+        else:
+            # fallback: outward = from ring center to switch
+            vx, vy = (sx - cx0, sy - cy0)
+
+        # normalize
+        L = math.hypot(vx, vy) or 1.0
+        out_vec[s] = (vx / L, vy / L)
+
+    def rad_away_from_compute(u, v, mag: float) -> float:
+        """
+        Choose rad sign so the arc bends AWAY from compute nodes.
+        That places local switch-switch curves on the empty side of the switch line.
+        """
+        x1, y1 = pos[u]
+        x2, y2 = pos[v]
+        dx, dy = (x2 - x1), (y2 - y1)
+
+        # left normal of segment u->v
+        nx_, ny_ = (-dy, dx)
+
+        # direction toward compute nodes (outward) ~ average of endpoints' outward vectors
+        oux, ouy = out_vec.get(u, (0.0, 0.0))
+        ovx, ovy = out_vec.get(v, (0.0, 0.0))
+        outx, outy = ((oux + ovx) / 2.0, (ouy + ovy) / 2.0)
+
+        # We want the curve to go to the opposite side => inward = -outward
+        inx, iny = (-outx, -outy)
+
+        # pick rad sign so the normal points inward
+        return mag if (nx_ * inx + ny_ * iny) > 0 else -mag
+
     # --- edges by type ---
     global_edges = [(u, v) for u, v, d in G.edges(data=True)
                     if d.get("kind") in ("global", "global_storage", "global_service")]
-
     inj_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "inj"]
 
-    local_chassis = [(u, v) for u, v, d in G.edges(data=True)
-                     if d.get("kind") in ("local_chassis",)]
+    local_extra = [(u, v) for u, v, d in G.edges(data=True) if d.get("kind") == "local_extra"]
 
-    # Global: black chords (between groups)
+    # --- draw global first ---
     if global_edges:
         nx.draw_networkx_edges(
             nx.Graph(global_edges),
             pos,
-            alpha=0.75,
-            width=1.8,
-            edge_color="black",
+            alpha=0.80,
+            width=2.0,
+            edge_color="black"
         )
 
-    # Local chassis: blue arcs (symbolic local links)
-    for (u, v) in local_chassis:
-        x1, y1 = pos[u]
-        x2, y2 = pos[v]
-        patch = FancyArrowPatch(
-            (x1, y1), (x2, y2),
-            connectionstyle="arc3,rad=0.25",
-            arrowstyle="-",
-            lw=1.4,
-            color="tab:blue",
-            alpha=0.70,
-            zorder=2,
-        )
-        ax.add_patch(patch)
+    # --- draw subgroup internal edges (per chassis) ---
+    chassis_keys = sorted({
+        (d.get("group"), d.get("chassis"))
+        for _, d in G.nodes(data=True)
+        if d.get("kind") == "switch" and d.get("chassis") is not None
+    })
 
-    # Injection: thicker and more visible (node <-> switch)
+    for gid, ch in chassis_keys:
+        sw = [n for n, d in G.nodes(data=True)
+              if d.get("kind") == "switch" and d.get("group") == gid and d.get("chassis") == ch]
+        sw.sort(key=lambda n: G.nodes[n].get("switch_in_chassis", 0))
+        if len(sw) < 4:
+            continue
+
+        s1, s2, s3, s4 = sw[0], sw[1], sw[2], sw[3]
+
+        # straight adjacency edges, includes S2-S3
+        for u, v in [(s2, s3)]:
+            x1, y1 = pos[u]
+            x2, y2 = pos[v]
+            ax.plot([x1, x2], [y1, y2],
+                    color="tab:blue", alpha=0.40, lw=1.0, zorder=1)
+
+        # inward curved diagonals
+        for (u, v, mag) in [(s1, s3, 0.22), (s2, s4, 0.22), (s1, s4, 0.32)]:
+            rad = rad_away_from_compute(u, v, mag)
+            patch = FancyArrowPatch(
+                posA=pos[u], posB=pos[v],
+                connectionstyle=f"arc3,rad={-rad}",
+                arrowstyle="-",
+                lw=1.0,
+                color="tab:blue",
+                alpha=0.40,
+                zorder=1
+            )
+            ax.add_patch(patch)
+
+    # --- double links: two curves on both sides ---
+    extra_counts = Counter()
+    for (u, v) in local_extra:
+        a, b = (u, v) if u < v else (v, u)
+        extra_counts[(a, b)] += 1
+
+    for (u, v), cnt in extra_counts.items():
+        if cnt <= 0:
+            continue
+
+        mag = 0.28
+        inward = rad_away_from_compute(u, v, mag)
+        outward = -inward
+
+        rads = [inward, outward] if cnt >= 2 else [inward]
+        for rad in rads:
+            patch = FancyArrowPatch(
+                posA=pos[u], posB=pos[v],
+                connectionstyle=f"arc3,rad={rad}",
+                arrowstyle="-",
+                lw=2.6,
+                color="tab:blue",
+                alpha=0.85,
+                zorder=2
+            )
+            ax.add_patch(patch)
+
+    # --- draw injection after local (so local doesn't sit on top of injection) ---
     if inj_edges:
         nx.draw_networkx_edges(
             nx.Graph(inj_edges),
             pos,
-            alpha=0.35,     # was ~0.06 before
-            width=1.2,      # thicker as requested
-            edge_color="gray",
+            alpha=0.45,
+            width=1.8,
+            edge_color="gray"
         )
 
-    # --- nodes by type + group_type ---
+    # --- nodes ---
     switches_compute = [n for n, d in G.nodes(data=True)
                         if d.get("kind") == "switch" and d.get("group_type") == "compute"]
     switches_storage = [n for n, d in G.nodes(data=True)
                         if d.get("kind") == "switch" and d.get("group_type") == "storage"]
     switches_service = [n for n, d in G.nodes(data=True)
                         if d.get("kind") == "switch" and d.get("group_type") == "service"]
-
     compute_nodes = [n for n, d in G.nodes(data=True) if d.get("kind") == "compute"]
 
-    # Switches as squares (colored)
-    nx.draw_networkx_nodes(
-        G, pos,
-        nodelist=switches_compute,
-        node_size=cfg.node_size_switch,
-        node_color="tab:green",
-        edgecolors="black",
-        linewidths=0.8,
-        node_shape="s",
-        label="Compute switches"
-    )
-    nx.draw_networkx_nodes(
-        G, pos,
-        nodelist=switches_storage,
-        node_size=cfg.node_size_switch,
-        node_color="tab:orange",
-        edgecolors="black",
-        linewidths=0.8,
-        node_shape="s",
-        label="Storage switches"
-    )
-    nx.draw_networkx_nodes(
-        G, pos,
-        nodelist=switches_service,
-        node_size=cfg.node_size_switch,
-        node_color="tab:purple",
-        edgecolors="black",
-        linewidths=0.8,
-        node_shape="s",
-        label="Service switches"
-    )
+    # draw nodes LAST so they are always on top
+    def scatter(nodes, color, size, label):
+        xs = [pos[n][0] for n in nodes]
+        ys = [pos[n][1] for n in nodes]
+        ax.scatter(xs, ys, s=size, c=color, edgecolors="black", linewidths=0.8,
+                   zorder=10, label=label)
 
-    # Compute nodes as blue circles
-    nx.draw_networkx_nodes(
-        G, pos,
-        nodelist=compute_nodes,
-        node_size=cfg.node_size_compute,
-        node_color="tab:blue",
-        edgecolors="black",
-        linewidths=0.5,
-        node_shape="o",
-        label="Compute nodes"
-    )
+    scatter(switches_compute, "tab:green", cfg.node_size_switch, "Compute switches")
+    scatter(switches_storage, "tab:orange", cfg.node_size_switch, "Storage switches")
+    scatter(switches_service, "tab:purple", cfg.node_size_switch, "Service switches")
+
+    ax.scatter([pos[n][0] for n in compute_nodes],
+               [pos[n][1] for n in compute_nodes],
+               s=cfg.node_size_compute, c="tab:blue",
+               edgecolors="black", linewidths=0.5, zorder=10,
+               label="Compute nodes")
 
     plt.tight_layout()
     plt.legend(scatterpoints=1, frameon=False, loc="upper left")
     plt.show()
-
 
 
 def dragonfly_ring_positions(G: nx.MultiGraph, cfg: TopologyConfig) -> Dict[str, Tuple[float, float]]:
