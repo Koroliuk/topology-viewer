@@ -1,17 +1,15 @@
 import math
+import zlib
 from collections import Counter
+from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
 
 import matplotlib.pyplot as plt
 import networkx as nx
+import numpy as np
 from matplotlib.collections import LineCollection
 from matplotlib.patches import FancyArrowPatch
-import numpy as np
-import numpy as np
-from collections import deque
-import zlib
-import random
 
 
 # ----------------------------
@@ -536,582 +534,742 @@ def print_metrics_ua(m: dict, scope: str):
     print(f"Вартість C: {m['C']}")
 
 
-class UnicastViewer:
+class CastViewer:
     def __init__(self, G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cfg: TopologyConfig):
-        self.show_discovery = True
-
-        # simulation machine
-        self.sim_active = False
-        self.sim_phase = "IDLE"  # IDLE, DISCOVERY, DELIVERY, DONE
-        self.H = None  # active simple graph
-
-        # BFS state (for discovery)
-        self.bfs_q = deque()
-        self.bfs_parent = {}
-        self.bfs_visited = set()
-        self.bfs_neighbors = {}  # node -> sorted neighbor list
-        self.bfs_idx = {}  # node -> next neighbor index
-        self.bfs_checked_segments = []  # list of ((x1,y1),(x2,y2))
-
-        # delivery state
-        self.path = []
-        self.path_i = 0  # current index in path (packet at path[path_i])
-
         self.G = G
         self.pos = pos
         self.cfg = cfg
 
-        # state
-        self.mode = "VIEW"  # VIEW, SELECT_SOURCE, SELECT_DEST
-        self.cast = "UNICAST"
+        # --- UI state ---
+        self.mode = "VIEW"  # VIEW, SELECT_SOURCE, SELECT_DEST_ONE, SELECT_DEST_MANY
+        self.cast = "UNICAST"  # UNICAST, BROADCAST, MULTICAST
+        self.show_discovery = True
+
         self.src: Optional[str] = None
         self.dst: Optional[str] = None
+        self.dsts: Set[str] = set()  # multicast group
 
-        # animation state
-        self.frames: List[dict] = []
-        self.frame_idx = 0
-        self.running = False
-        self.paused = False
-        self.timer = None
+        # --- simulation state ---
+        self.sim_active = False
+        self.sim_phase = "IDLE"  # IDLE, DISCOVERY, DELIVERY, DONE
+        self.H: Optional[nx.Graph] = None
 
-        # draw base
+        # discovery (BFS edge-by-edge)
+        self.bfs_q = deque()
+        self.bfs_parent: Dict[str, Optional[str]] = {}
+        self.bfs_visited: Set[str] = set()
+        self.bfs_neighbors: Dict[str, List[str]] = {}
+        self.bfs_idx: Dict[str, int] = {}
+        self.bfs_checked_segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+
+        self.discovery_targets: Optional[Set[str]] = None  # None means full traversal
+        self.discovery_targets_found: Set[str] = set()
+
+        # delivery
+        self.path: List[str] = []
+        self.path_i = 0  # packet at path[path_i]
+
+        # tree-based delivery (broadcast/multicast)
+        self.tree_children: Dict[str, List[str]] = {}
+        self.received: Set[str] = set()
+        self.frontier: List[str] = []
+        self.delivered_segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+
+        # --- base draw ---
         self.fig, self.ax = draw_topology_base(G, pos, cfg)
+        self.fig = self.ax.figure  # robust
 
-        # overlays
         self._init_overlays()
 
-        # UI text
         self.hud = self.ax.text(
             0.02, 0.02, self._hud_text(),
-            transform=self.ax.transAxes,
-            fontsize=10, va="bottom", ha="left"
+            transform=self.ax.transAxes, fontsize=10, va="bottom", ha="left"
         )
 
-        # events
-        self.cid_click = self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-        self.cid_key = self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        self.fig.canvas.mpl_connect("button_press_event", self._on_click)
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
-
+    # ---------- helpers ----------
     def _empty_offsets(self):
         return np.empty((0, 2))
+
+    def _active_graph(self) -> nx.Graph:
+        H = nx.Graph()
+        H.add_nodes_from(self.G.nodes())
+        for u, v, _d in self.G.edges(data=True):
+            H.add_edge(u, v)
+        return H
+
+    def _hud_text(self) -> str:
+        def short(x): return x if x is not None else "—"
+        return (
+            f"Cast: {self.cast} | Phase: {self.sim_phase} | Discovery(w): {'ON' if self.show_discovery else 'OFF'}\n"
+            f"Mode: {self.mode}\n"
+            f"src: {short(self.src)} | dst: {short(self.dst)} | multicast_dsts: {len(self.dsts)}\n"
+            "Keys: u(unicast) b(broadcast) m(multicast)  s(select src) d(select dst/group)\n"
+            "      w(toggle discovery) Enter(prepare) Space/ n(next step) r(reset overlays) c(clear multicast group)"
+        )
+
+    def _update_hud(self):
+        self.hud.set_text(self._hud_text())
+
+    def _set_msg(self, txt: str):
+        self.msg.set_text(txt)
+
+    def _nearest_node(self, x: float, y: float) -> Optional[str]:
+        # Increase threshold if selection is hard
+        thr2 = 0.75 ** 2
+        best, best_d2 = None, 1e18
+        for n, (nx_, ny_) in self.pos.items():
+            d2 = (nx_ - x) ** 2 + (ny_ - y) ** 2
+            if d2 < best_d2:
+                best, best_d2 = n, d2
+        return best if best is not None and best_d2 <= thr2 else None
 
     # ---------- overlays ----------
     def _init_overlays(self):
         # source/dest markers
-        self.src_sc = self.ax.scatter([], [], s=220, facecolors="none", edgecolors="black",
-                                      linewidths=2.2, zorder=30)
-        self.dst_sc = self.ax.scatter([], [], s=220, facecolors="none", edgecolors="black",
-                                      linewidths=2.2, zorder=30)
+        self.src_sc = self.ax.scatter([], [], s=240, facecolors="none", edgecolors="black", linewidths=2.2, zorder=40)
+        self.dst_sc = self.ax.scatter([], [], s=240, facecolors="none", edgecolors="black", linewidths=2.2, zorder=40)
+        self.dsts_sc = self.ax.scatter([], [], s=190, facecolors="none", edgecolors="black", linewidths=1.6, zorder=39)
 
-        # discovery overlay
-        self.frontier_sc = self.ax.scatter([], [], s=180, facecolors="none", edgecolors="black",
-                                           linewidths=1.8, alpha=0.9, zorder=25)
-        self.visited_sc = self.ax.scatter([], [], s=120, facecolors="none", edgecolors="black",
-                                          linewidths=1.0, alpha=0.25, zorder=20)
+        # discovery nodes
+        self.frontier_sc = self.ax.scatter([], [], s=170, facecolors="none", edgecolors="red", linewidths=2.0, zorder=35)
+        self.visited_sc = self.ax.scatter([], [], s=120, facecolors="none", edgecolors="red", linewidths=1.0, alpha=0.25, zorder=34)
 
-        # path overlay
-        self.path_bg = LineCollection([], linewidths=3.0, alpha=0.25, zorder=22)
-        self.path_fg = LineCollection([], linewidths=3.5, alpha=0.85, zorder=23)
-        self.ax.add_collection(self.path_bg)
-        self.ax.add_collection(self.path_fg)
-
-        # packet marker
-        self.packet_sc = self.ax.scatter([], [], s=90, zorder=35)
-
-        # message
-        self.msg = self.ax.text(
-            0.5, 0.98, "",
-            transform=self.ax.transAxes,
-            fontsize=11, va="top", ha="center"
-        )
-
-        self.checked_edges_lc = LineCollection([], colors="red", linewidths=1.5, alpha=0.35, zorder=24)
+        # discovery edges: checked + current (RED)
+        self.checked_edges_lc = LineCollection([], colors="red", linewidths=1.6, alpha=0.25, zorder=30)
+        self.current_edge_lc = LineCollection([], colors="red", linewidths=3.2, alpha=0.9, zorder=31)
         self.ax.add_collection(self.checked_edges_lc)
-
-        self.current_edge_lc = LineCollection([], colors="red", linewidths=3.2, alpha=0.9, zorder=26)
         self.ax.add_collection(self.current_edge_lc)
 
+        # delivery edges: accumulated + current wave/path (RED)
+        self.delivery_edges_lc = LineCollection([], colors="red", linewidths=3.0, alpha=0.55, zorder=32)
+        self.delivery_now_lc = LineCollection([], colors="red", linewidths=4.2, alpha=0.95, zorder=33)
+        self.ax.add_collection(self.delivery_edges_lc)
+        self.ax.add_collection(self.delivery_now_lc)
 
-    def _reset_overlays(self, keep_src_dst: bool = True):
+        # packet marker (RED so it’s not blue)
+        self.packet_sc = self.ax.scatter([], [], s=95, c="red", zorder=45)
+
+        # messages
+        self.msg = self.ax.text(0.5, 0.98, "", transform=self.ax.transAxes,
+                                fontsize=11, va="top", ha="center")
+
+        # Multicast destinations panel (toggle with 'l')
+        self.show_dsts_panel = True
+        self.dsts_panel = self.ax.text(
+            0.98, 0.02, "", transform=self.ax.transAxes,
+            fontsize=9, va="bottom", ha="right",
+            bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="black", alpha=0.75),
+            zorder=60
+        )
+
+        # Tooltip for right click node id
+        self.tooltip = self.ax.text(
+            0, 0, "", fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="black", alpha=0.85),
+            zorder=70,
+            visible=False
+        )
+
+    def _update_dsts_panel(self):
+        if not getattr(self, "show_dsts_panel", True):
+            self.dsts_panel.set_text("")
+            self.dsts_panel.set_visible(False)
+            return
+
+        if self.cast != "MULTICAST":
+            self.dsts_panel.set_text("")
+            self.dsts_panel.set_visible(False)
+            return
+
+        self.dsts_panel.set_visible(True)
+        items = sorted(self.dsts)
+        if not items:
+            self.dsts_panel.set_text("Multicast group:\n(empty)")
+            return
+
+        # show up to N, and then "... +k more"
+        N = 10
+        head = items[:N]
+        more = len(items) - len(head)
+        text = "Multicast group:\n" + "\n".join(head)
+        if more > 0:
+            text += f"\n… +{more} more"
+        self.dsts_panel.set_text(text)
+
+    def _show_tooltip(self, node_id: str, x: float, y: float):
+        d = self.G.nodes[node_id]
+        kind = d.get("kind", "?")
+        grp = d.get("group", "-")
+        sg = d.get("subgroup", "-")
+
+        self.tooltip.set_text(f"{node_id}\nkind={kind}, group={grp}, sg={sg}")
+        self.tooltip.set_position((x, y))
+        self.tooltip.set_visible(True)
+
+    def _hide_tooltip(self):
+        self.tooltip.set_visible(False)
+
+    def _update_src_dst_markers(self):
+        self.src_sc.set_offsets([self.pos[self.src]] if self.src else self._empty_offsets())
+
+        # If multicast: hide single-dst marker to avoid confusion
+        if self.cast == "MULTICAST":
+            self.dst_sc.set_offsets(self._empty_offsets())
+        else:
+            self.dst_sc.set_offsets([self.pos[self.dst]] if self.dst else self._empty_offsets())
+
+        self.dsts_sc.set_offsets([self.pos[n] for n in sorted(self.dsts)] if self.dsts else self._empty_offsets())
+
+        self._update_dsts_panel()
+
+    def _reset_overlays(self, keep_selection: bool = True):
         # stop sim
         self.sim_active = False
         self.sim_phase = "IDLE"
         self.H = None
 
-        # reset BFS state
+        # reset BFS
         self.bfs_q.clear()
         self.bfs_parent.clear()
         self.bfs_visited.clear()
         self.bfs_neighbors.clear()
         self.bfs_idx.clear()
         self.bfs_checked_segments = []
+        self.discovery_targets = None
+        self.discovery_targets_found = set()
 
         # reset delivery
         self.path = []
         self.path_i = 0
+        self.tree_children = {}
+        self.received = set()
+        self.frontier = []
+        self.delivered_segments = []
 
-        self.frames = []
-        self.frame_idx = 0
-        self.running = False
-        self.paused = False
-        if self.timer is not None:
-            self.timer.stop()
-            self.timer = None
-
+        # clear overlays
         self.frontier_sc.set_offsets(self._empty_offsets())
         self.visited_sc.set_offsets(self._empty_offsets())
-        self.path_bg.set_segments([])
-        self.path_fg.set_segments([])
         self.packet_sc.set_offsets(self._empty_offsets())
-        self.msg.set_text("")
 
-        # NEW: clear red discovery edges
         self.checked_edges_lc.set_segments([])
         self.current_edge_lc.set_segments([])
 
-        if not keep_src_dst:
+        self.delivery_edges_lc.set_segments([])
+        self.delivery_now_lc.set_segments([])
+
+        self._set_msg("")
+
+        if not keep_selection:
             self.src = None
             self.dst = None
-            self.src_sc.set_offsets(self._empty_offsets())
-            self.dst_sc.set_offsets(self._empty_offsets())
-
+            self.dsts.clear()
 
         self._update_src_dst_markers()
         self._update_hud()
         self.fig.canvas.draw_idle()
 
-
-    # ---------- graph for routing ----------
-    def _active_graph(self) -> nx.Graph:
-        # For Stage 2 unicast we assume everything is enabled.
-        # (We’ll extend this later to respect disabled nodes/edges.)
-        H = nx.Graph()
-        H.add_nodes_from(self.G.nodes())
-        for u, v, d in self.G.edges(data=True):
-            H.add_edge(u, v)  # Multi edges collapse to one
-        return H
-
-    # ---------- selection helpers ----------
-    def _nearest_node(self, x: float, y: float) -> Optional[str]:
-        # distance threshold depends on layout scale
-        # ring radius ~ 12, so 0.5 is a nice click radius
-        thr2 = 0.55 ** 2
-        best = None
-        best_d2 = 1e18
-        for n, (nx_, ny_) in self.pos.items():
-            d2 = (nx_ - x) ** 2 + (ny_ - y) ** 2
-            if d2 < best_d2:
-                best_d2 = d2
-                best = n
-        return best if best is not None and best_d2 <= thr2 else None
-
-    def _update_src_dst_markers(self):
-        if self.src is not None:
-            self.src_sc.set_offsets([self.pos[self.src]])
-        else:
-            self.src_sc.set_offsets(self._empty_offsets())
-
-        if self.dst is not None:
-            self.dst_sc.set_offsets([self.pos[self.dst]])
-        else:
-            self.dst_sc.set_offsets(self._empty_offsets())
-
-    # ---------- HUD ----------
-    def _hud_text(self) -> str:
-        def short(n: Optional[str]) -> str:
-            return n if n is not None else "—"
-
-        return (
-            f"Mode: {self.mode} | Cast: {self.cast} | Discovery: {'ON' if self.show_discovery else 'OFF'}\n"
-            f"src: {short(self.src)}\n"
-            f"dst: {short(self.dst)}\n"
-            "Keys: s(src) d(dst) u(unicast) w(toggle discovery) Enter(run) Space(pause) .(step) r(reset)"
-        )
-
-    def _update_hud(self):
-        self.hud.set_text(self._hud_text())
-
-    def _set_msg(self, text: str):
-        self.msg.set_text(text)
-
     # ---------- events ----------
     def _on_click(self, event):
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             return
-
         n = self._nearest_node(event.xdata, event.ydata)
         if n is None:
             return
 
-        if self.mode == "SELECT_SOURCE":
-            self.src = n
-            self._set_msg(f"Source set: {n}")
-            self.mode = "VIEW"
-            self._update_src_dst_markers()
-            self._update_hud()
+        # Right-click (button=3) shows tooltip with node id
+        if event.button == 3:
+            self._show_tooltip(n, event.xdata, event.ydata)
             self.fig.canvas.draw_idle()
+            return
+        else:
+            # left click hides tooltip
+            self._hide_tooltip()
 
-        elif self.mode == "SELECT_DEST":
-            self.dst = n
-            self._set_msg(f"Destination set: {n}")
+        if self.mode == "SELECT_SOURCE":
+            if self.src == n:
+                self.src = None
+                self._set_msg("Source cleared.")
+            else:
+                self.src = n
+                self._set_msg(f"Source set: {n}")
             self.mode = "VIEW"
             self._update_src_dst_markers()
             self._update_hud()
             self.fig.canvas.draw_idle()
+            return
+
+        if self.mode == "SELECT_DEST_ONE":
+            if self.dst == n:
+                self.dst = None
+                self._set_msg("Destination cleared.")
+            else:
+                self.dst = n
+                self._set_msg(f"Destination set: {n}")
+            self.mode = "VIEW"
+            self._update_src_dst_markers()
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
+
+        if self.mode == "SELECT_DEST_MANY":
+            if n in self.dsts:
+                self.dsts.remove(n)
+                self._set_msg(f"Removed from group: {n}")
+            else:
+                self.dsts.add(n)
+                self._set_msg(f"Added to group: {n}")
+            self._update_src_dst_markers()
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
 
     def _on_key(self, event):
         k = (event.key or "").lower()
 
-        if k == "w":
-            self.show_discovery = not self.show_discovery
-            self._set_msg(f"Discovery wave: {'ON' if self.show_discovery else 'OFF'}")
+        if k == "u":
+            self.cast = "UNICAST"
+            self.mode = "VIEW"
+            self._set_msg("Unicast selected.")
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
+
+        if k == "b":
+            self.cast = "BROADCAST"
+            self.mode = "VIEW"
+            self._set_msg("Broadcast selected.")
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
+
+        if k == "m":
+            self.cast = "MULTICAST"
+            self.mode = "VIEW"
+            self._set_msg("Multicast selected. Use 'd' + click to add group nodes.")
             self._update_hud()
             self.fig.canvas.draw_idle()
             return
 
         if k == "s":
             self.mode = "SELECT_SOURCE"
-            self._set_msg("Click a node to set SOURCE")
+            self._set_msg("Click a node to set SOURCE.")
             self._update_hud()
             self.fig.canvas.draw_idle()
             return
 
         if k == "d":
-            self.mode = "SELECT_DEST"
-            self._set_msg("Click a node to set DESTINATION")
+            if self.cast == "MULTICAST":
+                self.mode = "SELECT_DEST_MANY"
+                self._set_msg("Click nodes to toggle multicast destinations.")
+            else:
+                self.mode = "SELECT_DEST_ONE"
+                self._set_msg("Click a node to set DESTINATION.")
             self._update_hud()
             self.fig.canvas.draw_idle()
             return
 
-        if k == "u":
-            self.cast = "UNICAST"
-            self._set_msg("Unicast selected. Set src/dst and press Enter.")
+        if k == "c":
+            self.dsts.clear()
+            self._set_msg("Cleared multicast group.")
+            self._update_src_dst_markers()
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
+
+        if k == "w":
+            self.show_discovery = not self.show_discovery
+            self._set_msg(f"Discovery: {'ON' if self.show_discovery else 'OFF'}")
             self._update_hud()
             self.fig.canvas.draw_idle()
             return
 
         if k == "r":
-            self._reset_overlays(keep_src_dst=True)
+            self._reset_overlays(keep_selection=True)
             return
 
-        if k in (" ", "space", "n"):
+        # Enter = prepare (no stepping yet)
+        if k in ("enter", "return"):
+            self.prepare()
+            return
+
+        # Space / n = one step
+        if event.key in (" ", "space", "n"):
             self.step_once()
             return
 
-        if k in ("enter", "return"):
-            self.prepare_unicast()  # does NOT step
+        if k == "l":
+            self.show_dsts_panel = not getattr(self, "show_dsts_panel", True)
+            self._set_msg(f"Destinations panel: {'ON' if self.show_dsts_panel else 'OFF'}")
+            self._update_src_dst_markers()
+            self._update_hud()
+            self.fig.canvas.draw_idle()
             return
 
-    def prepare_unicast(self):
-        # clear dynamic overlays but keep src/dst markers
-        self._reset_overlays(keep_src_dst=True)
+        if k == "z":
+            self.src = None
+            self._set_msg("Source cleared (z).")
+            self._update_src_dst_markers()
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
 
-        if self.src is None or self.dst is None:
-            self._set_msg("Set src and dst first (s + click, d + click).")
+        if k == "x":
+            self.dst = None
+            self._set_msg("Destination cleared (x).")
+            self._update_src_dst_markers()
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
+
+
+    # ---------- prepare ----------
+    def prepare(self):
+        self._reset_overlays(keep_selection=True)
+
+        if self.src is None:
+            self._set_msg("Set src first (press 's' then click).")
             self.fig.canvas.draw_idle()
             return
 
         self.H = self._active_graph()
 
-        if self.src not in self.H or self.dst not in self.H:
-            self._set_msg("src/dst not in active graph.")
-            self.fig.canvas.draw_idle()
-            return
+        if self.cast == "UNICAST":
+            if self.dst is None:
+                self._set_msg("Set dst first (press 'd' then click).")
+                return
+            if self.show_discovery:
+                self._init_bfs_discovery(targets={self.dst})
+                self._set_msg("Prepared UNICAST DISCOVERY. Press Space to check next edge.")
+            else:
+                self._init_unicast_delivery_direct()
+                self._set_msg("Prepared UNICAST DELIVERY. Press Space to traverse next hop.")
+
+        elif self.cast == "BROADCAST":
+            if self.show_discovery:
+                self._init_bfs_discovery(targets=None)  # full traversal
+                self._set_msg("Prepared BROADCAST DISCOVERY. Press Space to check next edge.")
+            else:
+                self._build_bfs_parents_full()
+                self._init_tree_delivery_from_parents(all_targets=True)
+                self._set_msg("Prepared BROADCAST WAVES (no discovery). Press Space for next wave.")
+
+        elif self.cast == "MULTICAST":
+            if not self.dsts:
+                self._set_msg("Pick multicast group: press 'd' and click nodes (add at least 1).")
+                return
+            if self.show_discovery:
+                self._init_bfs_discovery(targets=set(self.dsts))
+                self._set_msg("Prepared MULTICAST DISCOVERY. Press Space to check next edge.")
+            else:
+                self._build_bfs_parents_until_targets(set(self.dsts))
+                self._init_multicast_tree_delivery(set(self.dsts))
+                self._set_msg("Prepared MULTICAST WAVES (no discovery). Press Space for next wave.")
 
         self.sim_active = True
-
-        if self.show_discovery:
-            # initialize BFS state, but DO NOT check any edge yet
-            self.sim_phase = "DISCOVERY"
-            self.bfs_q = deque([self.src])
-            self.bfs_parent = {self.src: None}
-            self.bfs_visited = {self.src}
-            self.bfs_checked_segments = []
-
-            # deterministic neighbor order
-            self.bfs_neighbors = {}
-            for u in self.H.nodes():
-                nbrs = sorted(list(self.H.neighbors(u)))  # stable base
-                # per-node deterministic seed based on cfg.seed and node name
-                seed_u = (int(self.cfg.seed) * 1000003) ^ zlib.adler32(str(u).encode("utf-8"))
-                rnd_u = random.Random(seed_u)
-                rnd_u.shuffle(nbrs)
-                self.bfs_neighbors[u] = nbrs
-            self.bfs_idx = {u: 0 for u in self.H.nodes()}
-
-            # show initial visited/frontier (optional)
-            self.visited_sc.set_offsets([self.pos[self.src]])
-            self.frontier_sc.set_offsets([self.pos[self.src]])
-            self._set_msg("Prepared DISCOVERY. Press Space to check next edge.")
-        else:
-            # skip discovery: compute path now, but DO NOT traverse any hop
-            try:
-                self.path = nx.shortest_path(self.H, self.src, self.dst)
-            except nx.NetworkXNoPath:
-                self.sim_phase = "DONE"
-                self.sim_active = False
-                self._set_msg("No path.")
-                self.fig.canvas.draw_idle()
-                return
-
-            self.sim_phase = "DELIVERY"
-            self.path_i = 0
-
-            # path background for context (optional)
-            segs = [(self.pos[self.path[i]], self.pos[self.path[i+1]]) for i in range(len(self.path)-1)]
-            self.path_bg.set_segments(segs)
-            self.path_fg.set_segments([])
-
-            # packet starts at src but we don't move yet
-            self.packet_sc.set_offsets([self.pos[self.path[0]]])
-
-            self._set_msg("Prepared DELIVERY. Press Space to traverse next hop.")
-
         self._update_src_dst_markers()
         self._update_hud()
         self.fig.canvas.draw_idle()
 
+    # ---------- BFS discovery init / stepping ----------
+    def _init_bfs_discovery(self, targets: Optional[Set[str]]):
+        self.sim_phase = "DISCOVERY"
+        self.discovery_targets = targets
+        self.discovery_targets_found = set()
 
-    def step_once(self):
-        if not self.sim_active or self.sim_phase in ("IDLE", "DONE"):
-            return
+        self.bfs_q = deque([self.src])
+        self.bfs_parent = {self.src: None}
+        self.bfs_visited = {self.src}
+        self.bfs_checked_segments = []
 
-        if self.sim_phase == "DISCOVERY":
-            self._step_discovery_one_edge()
-        elif self.sim_phase == "DELIVERY":
-            self._step_delivery_one_hop()
+        # seeded shuffled neighbors (reproducible)
+        self.bfs_neighbors = {}
+        self.bfs_idx = {}
+        for u in self.H.nodes():
+            nbrs = sorted(list(self.H.neighbors(u)))
+            seed_u = (int(self.cfg.seed) * 1000003) ^ zlib.adler32(str(u).encode("utf-8"))
+            rnd_u = random.Random(seed_u)
+            rnd_u.shuffle(nbrs)
+            self.bfs_neighbors[u] = nbrs
+            self.bfs_idx[u] = 0
 
-        self.fig.canvas.draw_idle()
+        # initial overlay
+        self.visited_sc.set_offsets([self.pos[self.src]])
+        self.frontier_sc.set_offsets([self.pos[self.src]])
 
-
-    def _step_discovery_one_edge(self):
-        # find next node in queue that still has unchecked neighbors
+    def _step_bfs_one_edge(self):
+        # advance to next node in queue with remaining neighbors
         while self.bfs_q:
             u = self.bfs_q[0]
-            nbrs = self.bfs_neighbors[u]
-            i = self.bfs_idx[u]
-            if i < len(nbrs):
+            if self.bfs_idx[u] < len(self.bfs_neighbors[u]):
                 break
             self.bfs_q.popleft()
 
         if not self.bfs_q:
-            # BFS exhausted
-            self.sim_phase = "DONE"
-            self.sim_active = False
+            # finished traversal
             self.current_edge_lc.set_segments([])
-            self._set_msg("Discovery finished: destination unreachable (no path).")
-            return
+            return False  # no more edges
 
         u = self.bfs_q[0]
-        nbrs = self.bfs_neighbors[u]
-        i = self.bfs_idx[u]
-        v = nbrs[i]
-        self.bfs_idx[u] = i + 1
+        v = self.bfs_neighbors[u][self.bfs_idx[u]]
+        self.bfs_idx[u] += 1
 
-        # "check" edge (u,v)
         seg = (self.pos[u], self.pos[v])
         self.bfs_checked_segments.append(seg)
         self.checked_edges_lc.set_segments(self.bfs_checked_segments)
         self.current_edge_lc.set_segments([seg])
 
-        # BFS relax / discover
+        # discover
         if v not in self.bfs_visited:
             self.bfs_visited.add(v)
             self.bfs_parent[v] = u
             self.bfs_q.append(v)
 
-        # update overlays: visited and frontier (= queue)
+        # update overlays
         self.visited_sc.set_offsets([self.pos[n] for n in self.bfs_visited] if self.bfs_visited else self._empty_offsets())
         self.frontier_sc.set_offsets([self.pos[n] for n in self.bfs_q] if self.bfs_q else self._empty_offsets())
 
-        # if reached destination, finalize path but don't move yet
-        if v == self.dst:
-            self.path = self._reconstruct_path(self.dst)
-            self.sim_phase = "DELIVERY"
-            self.path_i = 0
+        # targets tracking
+        if self.discovery_targets is not None and v in self.discovery_targets:
+            self.discovery_targets_found.add(v)
 
-            segs = [(self.pos[self.path[i]], self.pos[self.path[i+1]]) for i in range(len(self.path)-1)]
-            self.path_bg.set_segments(segs)
-            self.path_fg.set_segments([])
-            self.packet_sc.set_offsets([self.pos[self.path[0]]])
+        self._set_msg(f"Checked edge: {u} → {v}")
+        return True
 
-            self.current_edge_lc.set_segments([])  # stop highlighting checks
-            self._set_msg("Path found. Press Space to traverse next hop (DELIVERY).")
-        else:
-            self._set_msg(f"Checked edge: {u} → {v}")
+    # ---------- direct build without interactive discovery ----------
+    def _build_bfs_parents_full(self):
+        # Build parents for all reachable nodes using seeded neighbor order
+        self._init_bfs_discovery(targets=None)
+        while self._step_bfs_one_edge():
+            pass
+        # clear discovery visuals (optional)
+        self.frontier_sc.set_offsets(self._empty_offsets())
+        self.visited_sc.set_offsets(self._empty_offsets())
+        self.current_edge_lc.set_segments([])
+        self.checked_edges_lc.set_segments([])
 
+    def _build_bfs_parents_until_targets(self, targets: Set[str]):
+        self._init_bfs_discovery(targets=set(targets))
+        while True:
+            progressed = self._step_bfs_one_edge()
+            if not progressed:
+                break
+            if self.discovery_targets_found == set(targets):
+                break
+        # clear discovery visuals (optional)
+        self.frontier_sc.set_offsets(self._empty_offsets())
+        self.visited_sc.set_offsets(self._empty_offsets())
+        self.current_edge_lc.set_segments([])
+        self.checked_edges_lc.set_segments([])
+
+    # ---------- reconstruct path ----------
     def _reconstruct_path(self, dst: str) -> List[str]:
-        path = []
+        if dst not in self.bfs_parent:
+            return []
+        p = []
         cur = dst
         while cur is not None:
-            path.append(cur)
+            p.append(cur)
             cur = self.bfs_parent.get(cur)
-        path.reverse()
-        return path
+        p.reverse()
+        return p
 
-    def _step_delivery_one_hop(self):
-        if not self.path or len(self.path) == 1:
+    # ---------- init delivery ----------
+    def _init_unicast_delivery_direct(self):
+        self.sim_phase = "DELIVERY"
+        try:
+            self.path = nx.shortest_path(self.H, self.src, self.dst)
+        except nx.NetworkXNoPath:
             self.sim_phase = "DONE"
             self.sim_active = False
-            self._set_msg("Trivial path (src==dst). Done.")
+            self._set_msg("No path.")
+            return
+
+        self.path_i = 0
+        self.packet_sc.set_offsets([self.pos[self.path[0]]])
+        self.delivered_segments = []
+        self.delivery_edges_lc.set_segments([])
+        self.delivery_now_lc.set_segments([])
+
+    def _init_tree_delivery_from_parents(self, all_targets: bool):
+        # build a directed "children" map from bfs_parent
+        self.sim_phase = "DELIVERY"
+        self.tree_children = {}
+        for v, p in self.bfs_parent.items():
+            if p is None:
+                continue
+            self.tree_children.setdefault(p, []).append(v)
+
+        # wave state
+        self.received = {self.src}
+        self.frontier = [self.src]
+        self.delivered_segments = []
+        self.delivery_edges_lc.set_segments([])
+        self.delivery_now_lc.set_segments([])
+
+        # hide discovery markers
+        self.frontier_sc.set_offsets(self._empty_offsets())
+        self.visited_sc.set_offsets(self._empty_offsets())
+        self.current_edge_lc.set_segments([])
+        self.checked_edges_lc.set_segments([])
+
+    def _init_multicast_tree_delivery(self, targets: Set[str]):
+        # union of shortest paths to each target using bfs_parent
+        edges = set()
+        used_nodes = {self.src}
+
+        for t in targets:
+            path = self._reconstruct_path(t)
+            if not path:
+                continue
+            used_nodes.update(path)
+            for i in range(len(path) - 1):
+                edges.add((path[i], path[i + 1]))
+
+        # build children map from union edges
+        self.tree_children = {}
+        for a, b in edges:
+            self.tree_children.setdefault(a, []).append(b)
+
+        self.sim_phase = "DELIVERY"
+        self.received = {self.src}
+        self.frontier = [self.src]
+        self.delivered_segments = []
+        self.delivery_edges_lc.set_segments([])
+        self.delivery_now_lc.set_segments([])
+
+        # hide discovery markers
+        self.frontier_sc.set_offsets(self._empty_offsets())
+        self.visited_sc.set_offsets(self._empty_offsets())
+        self.current_edge_lc.set_segments([])
+        self.checked_edges_lc.set_segments([])
+
+    # ---------- stepping ----------
+    def step_once(self):
+        if not self.sim_active or self.sim_phase in ("IDLE", "DONE"):
+            return
+
+        if self.sim_phase == "DISCOVERY":
+            progressed = self._step_bfs_one_edge()
+            if not progressed:
+                # finished traversal without finding targets (or broadcast done)
+                self._finish_discovery()
+                self.fig.canvas.draw_idle()
+                return
+
+            # stop conditions
+            if self.cast == "UNICAST":
+                if self.dst in self.bfs_visited:
+                    self._finish_discovery()
+            elif self.cast == "MULTICAST":
+                if self.discovery_targets is not None and self.discovery_targets_found == self.discovery_targets:
+                    self._finish_discovery()
+            # BROADCAST finishes only when BFS exhausted (progressed becomes False)
+
+        elif self.sim_phase == "DELIVERY":
+            if self.cast == "UNICAST":
+                self._step_unicast_one_hop()
+            elif self.cast == "BROADCAST":
+                self._step_tree_one_wave(label="Broadcast wave")
+            elif self.cast == "MULTICAST":
+                self._step_tree_one_wave(label="Multicast wave")
+
+        self._update_hud()
+        self.fig.canvas.draw_idle()
+
+    def _finish_discovery(self):
+        if self.cast == "UNICAST":
+            self.path = self._reconstruct_path(self.dst)
+            if not self.path:
+                self.sim_phase = "DONE"
+                self.sim_active = False
+                self._set_msg("No path (unreachable).")
+                return
+            self.sim_phase = "DELIVERY"
+            self.path_i = 0
+            self.packet_sc.set_offsets([self.pos[self.path[0]]])
+            self.delivered_segments = []
+            self.delivery_edges_lc.set_segments([])
+            self.delivery_now_lc.set_segments([])
+            self._set_msg("Path found. Press Space to traverse next hop.")
+            # hide discovery overlays
+            self.frontier_sc.set_offsets(self._empty_offsets())
+            self.visited_sc.set_offsets(self._empty_offsets())
+            self.current_edge_lc.set_segments([])
+            self.checked_edges_lc.set_segments([])
+
+        elif self.cast == "BROADCAST":
+            self._init_tree_delivery_from_parents(all_targets=True)
+            self._set_msg("Broadcast tree ready. Press Space for next wave.")
+
+        elif self.cast == "MULTICAST":
+            self._init_multicast_tree_delivery(set(self.dsts))
+            self._set_msg("Multicast tree ready. Press Space for next wave.")
+
+    # ---------- delivery steps ----------
+    def _step_unicast_one_hop(self):
+        if not self.path:
+            self.sim_phase = "DONE"
+            self.sim_active = False
+            self._set_msg("No path.")
             return
 
         if self.path_i >= len(self.path) - 1:
             self.sim_phase = "DONE"
             self.sim_active = False
             self._set_msg("Delivered. Done.")
+            self.delivery_now_lc.set_segments([])
             return
 
         a = self.path[self.path_i]
         b = self.path[self.path_i + 1]
-
-        # move packet to next node
         self.path_i += 1
-        self.packet_sc.set_offsets([self.pos[b]])
 
-        # extend highlighted delivered segments
-        segs_done = [(self.pos[self.path[i]], self.pos[self.path[i+1]]) for i in range(self.path_i)]
-        self.path_fg.set_segments(segs_done)
+        seg = (self.pos[a], self.pos[b])
+        self.delivered_segments.append(seg)
+
+        self.delivery_edges_lc.set_segments(self.delivered_segments)
+        self.delivery_now_lc.set_segments([seg])
+        self.packet_sc.set_offsets([self.pos[b]])
 
         self._set_msg(f"Traversed hop: {a} → {b}")
 
-        self.frontier_sc.set_offsets(self._empty_offsets())
-        self.visited_sc.set_offsets(self._empty_offsets())
-
-    # ---------- unicast: frames ----------
-    def start_unicast(self):
-        self._reset_overlays(keep_src_dst=True)
-
-        if self.src is None or self.dst is None:
-            self._set_msg("Set src and dst first (press s/d, then click nodes).")
-            self.fig.canvas.draw_idle()
-            return
-
-        H = self._active_graph()
-
-        if self.src not in H or self.dst not in H:
-            self._set_msg("src/dst not in active graph.")
-            self.fig.canvas.draw_idle()
-            return
-
-        try:
-            # shortest path for delivery
-            path = nx.shortest_path(H, self.src, self.dst)
-        except nx.NetworkXNoPath:
-            self._set_msg("No path (graph disconnected or failures).")
-            self.fig.canvas.draw_idle()
-            return
-
-        # build discovery wave (BFS frontiers) until dst reached
-        discovery = self._bfs_discovery_frames(H, self.src, self.dst) if self.show_discovery else []
-        delivery = self._delivery_frames(path)
-        self.frames = discovery + delivery
-        self.frame_idx = 0
-        self.running = True
-        self.paused = False
-
-        # pre-draw full path background (for clarity)
-        segs = [(self.pos[path[i]], self.pos[path[i+1]]) for i in range(len(path)-1)]
-        self.path_bg.set_segments(segs)
-        self.path_fg.set_segments([])
-
-        # start timer
-        self.timer = self.fig.canvas.new_timer(interval=260)
-        self.timer.add_callback(self._advance_frame)
-        self.timer.start()
-
-        self._set_msg("Running unicast…")
-        self._update_src_dst_markers()
-        self._update_hud()
-        self.fig.canvas.draw_idle()
-
-    def _bfs_discovery_frames(self, H: nx.Graph, src: str, dst: str) -> List[dict]:
-        visited: Set[str] = set([src])
-        frontier: List[str] = [src]
-        frames: List[dict] = []
-
-        while frontier:
-            frames.append({
-                "phase": "DISCOVERY",
-                "frontier": list(frontier),
-                "visited": list(visited),
-            })
-            if dst in frontier:
-                break
-
-            nxt = []
-            for u in frontier:
-                for v in H.neighbors(u):
-                    if v not in visited:
-                        visited.add(v)
-                        nxt.append(v)
-            frontier = nxt
-
-        return frames
-
-    def _delivery_frames(self, path: List[str]) -> List[dict]:
-        frames: List[dict] = []
-        # packet starts at path[0], then moves each hop
-        for i in range(len(path)):
-            frames.append({
-                "phase": "DELIVERY",
-                "path": path,
-                "hop": i,  # index in path where packet is
-            })
-        return frames
-
-    def _advance_frame(self):
-        if not self.running:
-            return
-        if self.paused:
-            return
-
-        if self.frame_idx >= len(self.frames):
-            self.running = False
+    def _step_tree_one_wave(self, label: str):
+        if not self.frontier:
+            self.sim_phase = "DONE"
+            self.sim_active = False
             self._set_msg("Done.")
-            self.fig.canvas.draw_idle()
-            if self.timer is not None:
-                self.timer.stop()
-                self.timer = None
+            self.delivery_now_lc.set_segments([])
             return
 
-        fr = self.frames[self.frame_idx]
-        self._render_frame(fr)
-        self.frame_idx += 1
-        self.fig.canvas.draw_idle()
+        next_frontier = []
+        wave_segs = []
 
-    def _render_frame(self, fr: dict):
-        if fr["phase"] == "DISCOVERY":
-            frontier_pts = [self.pos[n] for n in fr["frontier"]]
-            visited_pts = [self.pos[n] for n in fr["visited"]]
+        for u in self.frontier:
+            for v in self.tree_children.get(u, []):
+                if v in self.received:
+                    continue
+                self.received.add(v)
+                next_frontier.append(v)
+                wave_segs.append((self.pos[u], self.pos[v]))
 
-            self.frontier_sc.set_offsets(frontier_pts if frontier_pts else [])
-            self.visited_sc.set_offsets(visited_pts if visited_pts else [])
+        # accumulate delivered edges, highlight current wave
+        self.delivered_segments.extend(wave_segs)
+        self.delivery_edges_lc.set_segments(self.delivered_segments)
+        self.delivery_now_lc.set_segments(wave_segs)
 
-            # during discovery, no packet movement yet
-            self.packet_sc.set_offsets(self._empty_offsets())
-            self.path_fg.set_segments([])
+        # update frontier to show waves visually (reuse frontier_sc)
+        self.frontier = next_frontier
+        self.frontier_sc.set_offsets([self.pos[n] for n in self.frontier] if self.frontier else self._empty_offsets())
 
-        elif fr["phase"] == "DELIVERY":
-            path = fr["path"]
-            hop = fr["hop"]
-
-            # hide discovery overlays
-            self.frontier_sc.set_offsets(self._empty_offsets())
-            self.visited_sc.set_offsets(self._empty_offsets())
-
-            # progress path highlight up to current hop
-            segs_done = []
-            for i in range(min(hop, len(path)-1)):
-                segs_done.append((self.pos[path[i]], self.pos[path[i+1]]))
-            self.path_fg.set_segments(segs_done)
-
-            # packet position
-            self.packet_sc.set_offsets([self.pos[path[hop]]])
-
-            if hop == len(path) - 1:
-                self._set_msg("Delivered.")
-
+        if wave_segs:
+            self._set_msg(f"{label}: delivered to {len(next_frontier)} new nodes")
+        else:
+            self._set_msg(f"{label}: no new nodes (finished)")
+            self.sim_phase = "DONE"
+            self.sim_active = False
 
 
 if __name__ == "__main__":
@@ -1129,7 +1287,7 @@ if __name__ == "__main__":
     m = compute_metrics_ua(G, cfg, scope="all")
     print_metrics_ua(m, scope="all")
 
-    viewer = UnicastViewer(G, pos, cfg)
+    viewer = CastViewer(G, pos, cfg)
     plt.show()
 
 
