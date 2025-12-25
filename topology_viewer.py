@@ -1,12 +1,17 @@
 import math
-import random
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
 from collections import Counter
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Set
 
-import networkx as nx
 import matplotlib.pyplot as plt
+import networkx as nx
+from matplotlib.collections import LineCollection
 from matplotlib.patches import FancyArrowPatch
+import numpy as np
+import numpy as np
+from collections import deque
+import zlib
+import random
 
 
 # ----------------------------
@@ -242,9 +247,8 @@ def dragonfly_ring_positions(G: nx.MultiGraph, cfg: TopologyConfig) -> Dict[str,
 # ----------------------------
 # Draw (compute-only)
 # ----------------------------
-def draw_topology_dragonflyish(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cfg: TopologyConfig) -> None:
-    plt.figure(figsize=cfg.figsize)
-    ax = plt.gca()
+def draw_topology_base(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cfg: TopologyConfig) -> None:
+    fig, ax = plt.subplots(figsize=cfg.figsize)
     ax.axis("off")
 
     switches = [n for n, d in G.nodes(data=True) if d.get("kind") == "switch"]
@@ -414,9 +418,9 @@ def draw_topology_dragonflyish(G: nx.MultiGraph, pos: Dict[str, Tuple[float, flo
                s=cfg.node_size_compute, c="tab:blue",
                edgecolors="black", linewidths=0.5, zorder=10, label="Обчислювальні вузли")
 
-    plt.tight_layout()
-    plt.legend(scatterpoints=1, frameon=False, loc="upper left")
-    plt.show()
+    fig.tight_layout()
+    ax.legend(scatterpoints=1, frameon=False, loc="upper left")
+    return fig, ax
 
 
 import random
@@ -532,6 +536,584 @@ def print_metrics_ua(m: dict, scope: str):
     print(f"Вартість C: {m['C']}")
 
 
+class UnicastViewer:
+    def __init__(self, G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cfg: TopologyConfig):
+        self.show_discovery = True
+
+        # simulation machine
+        self.sim_active = False
+        self.sim_phase = "IDLE"  # IDLE, DISCOVERY, DELIVERY, DONE
+        self.H = None  # active simple graph
+
+        # BFS state (for discovery)
+        self.bfs_q = deque()
+        self.bfs_parent = {}
+        self.bfs_visited = set()
+        self.bfs_neighbors = {}  # node -> sorted neighbor list
+        self.bfs_idx = {}  # node -> next neighbor index
+        self.bfs_checked_segments = []  # list of ((x1,y1),(x2,y2))
+
+        # delivery state
+        self.path = []
+        self.path_i = 0  # current index in path (packet at path[path_i])
+
+        self.G = G
+        self.pos = pos
+        self.cfg = cfg
+
+        # state
+        self.mode = "VIEW"  # VIEW, SELECT_SOURCE, SELECT_DEST
+        self.cast = "UNICAST"
+        self.src: Optional[str] = None
+        self.dst: Optional[str] = None
+
+        # animation state
+        self.frames: List[dict] = []
+        self.frame_idx = 0
+        self.running = False
+        self.paused = False
+        self.timer = None
+
+        # draw base
+        self.fig, self.ax = draw_topology_base(G, pos, cfg)
+
+        # overlays
+        self._init_overlays()
+
+        # UI text
+        self.hud = self.ax.text(
+            0.02, 0.02, self._hud_text(),
+            transform=self.ax.transAxes,
+            fontsize=10, va="bottom", ha="left"
+        )
+
+        # events
+        self.cid_click = self.fig.canvas.mpl_connect("button_press_event", self._on_click)
+        self.cid_key = self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+
+
+    def _empty_offsets(self):
+        return np.empty((0, 2))
+
+    # ---------- overlays ----------
+    def _init_overlays(self):
+        # source/dest markers
+        self.src_sc = self.ax.scatter([], [], s=220, facecolors="none", edgecolors="black",
+                                      linewidths=2.2, zorder=30)
+        self.dst_sc = self.ax.scatter([], [], s=220, facecolors="none", edgecolors="black",
+                                      linewidths=2.2, zorder=30)
+
+        # discovery overlay
+        self.frontier_sc = self.ax.scatter([], [], s=180, facecolors="none", edgecolors="black",
+                                           linewidths=1.8, alpha=0.9, zorder=25)
+        self.visited_sc = self.ax.scatter([], [], s=120, facecolors="none", edgecolors="black",
+                                          linewidths=1.0, alpha=0.25, zorder=20)
+
+        # path overlay
+        self.path_bg = LineCollection([], linewidths=3.0, alpha=0.25, zorder=22)
+        self.path_fg = LineCollection([], linewidths=3.5, alpha=0.85, zorder=23)
+        self.ax.add_collection(self.path_bg)
+        self.ax.add_collection(self.path_fg)
+
+        # packet marker
+        self.packet_sc = self.ax.scatter([], [], s=90, zorder=35)
+
+        # message
+        self.msg = self.ax.text(
+            0.5, 0.98, "",
+            transform=self.ax.transAxes,
+            fontsize=11, va="top", ha="center"
+        )
+
+        self.checked_edges_lc = LineCollection([], colors="red", linewidths=1.5, alpha=0.35, zorder=24)
+        self.ax.add_collection(self.checked_edges_lc)
+
+        self.current_edge_lc = LineCollection([], colors="red", linewidths=3.2, alpha=0.9, zorder=26)
+        self.ax.add_collection(self.current_edge_lc)
+
+
+    def _reset_overlays(self, keep_src_dst: bool = True):
+        # stop sim
+        self.sim_active = False
+        self.sim_phase = "IDLE"
+        self.H = None
+
+        # reset BFS state
+        self.bfs_q.clear()
+        self.bfs_parent.clear()
+        self.bfs_visited.clear()
+        self.bfs_neighbors.clear()
+        self.bfs_idx.clear()
+        self.bfs_checked_segments = []
+
+        # reset delivery
+        self.path = []
+        self.path_i = 0
+
+        self.frames = []
+        self.frame_idx = 0
+        self.running = False
+        self.paused = False
+        if self.timer is not None:
+            self.timer.stop()
+            self.timer = None
+
+        self.frontier_sc.set_offsets(self._empty_offsets())
+        self.visited_sc.set_offsets(self._empty_offsets())
+        self.path_bg.set_segments([])
+        self.path_fg.set_segments([])
+        self.packet_sc.set_offsets(self._empty_offsets())
+        self.msg.set_text("")
+
+        # NEW: clear red discovery edges
+        self.checked_edges_lc.set_segments([])
+        self.current_edge_lc.set_segments([])
+
+        if not keep_src_dst:
+            self.src = None
+            self.dst = None
+            self.src_sc.set_offsets(self._empty_offsets())
+            self.dst_sc.set_offsets(self._empty_offsets())
+
+
+        self._update_src_dst_markers()
+        self._update_hud()
+        self.fig.canvas.draw_idle()
+
+
+    # ---------- graph for routing ----------
+    def _active_graph(self) -> nx.Graph:
+        # For Stage 2 unicast we assume everything is enabled.
+        # (We’ll extend this later to respect disabled nodes/edges.)
+        H = nx.Graph()
+        H.add_nodes_from(self.G.nodes())
+        for u, v, d in self.G.edges(data=True):
+            H.add_edge(u, v)  # Multi edges collapse to one
+        return H
+
+    # ---------- selection helpers ----------
+    def _nearest_node(self, x: float, y: float) -> Optional[str]:
+        # distance threshold depends on layout scale
+        # ring radius ~ 12, so 0.5 is a nice click radius
+        thr2 = 0.55 ** 2
+        best = None
+        best_d2 = 1e18
+        for n, (nx_, ny_) in self.pos.items():
+            d2 = (nx_ - x) ** 2 + (ny_ - y) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best = n
+        return best if best is not None and best_d2 <= thr2 else None
+
+    def _update_src_dst_markers(self):
+        if self.src is not None:
+            self.src_sc.set_offsets([self.pos[self.src]])
+        else:
+            self.src_sc.set_offsets(self._empty_offsets())
+
+        if self.dst is not None:
+            self.dst_sc.set_offsets([self.pos[self.dst]])
+        else:
+            self.dst_sc.set_offsets(self._empty_offsets())
+
+    # ---------- HUD ----------
+    def _hud_text(self) -> str:
+        def short(n: Optional[str]) -> str:
+            return n if n is not None else "—"
+
+        return (
+            f"Mode: {self.mode} | Cast: {self.cast} | Discovery: {'ON' if self.show_discovery else 'OFF'}\n"
+            f"src: {short(self.src)}\n"
+            f"dst: {short(self.dst)}\n"
+            "Keys: s(src) d(dst) u(unicast) w(toggle discovery) Enter(run) Space(pause) .(step) r(reset)"
+        )
+
+    def _update_hud(self):
+        self.hud.set_text(self._hud_text())
+
+    def _set_msg(self, text: str):
+        self.msg.set_text(text)
+
+    # ---------- events ----------
+    def _on_click(self, event):
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+
+        n = self._nearest_node(event.xdata, event.ydata)
+        if n is None:
+            return
+
+        if self.mode == "SELECT_SOURCE":
+            self.src = n
+            self._set_msg(f"Source set: {n}")
+            self.mode = "VIEW"
+            self._update_src_dst_markers()
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+
+        elif self.mode == "SELECT_DEST":
+            self.dst = n
+            self._set_msg(f"Destination set: {n}")
+            self.mode = "VIEW"
+            self._update_src_dst_markers()
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+
+    def _on_key(self, event):
+        k = (event.key or "").lower()
+
+        if k == "w":
+            self.show_discovery = not self.show_discovery
+            self._set_msg(f"Discovery wave: {'ON' if self.show_discovery else 'OFF'}")
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
+
+        if k == "s":
+            self.mode = "SELECT_SOURCE"
+            self._set_msg("Click a node to set SOURCE")
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
+
+        if k == "d":
+            self.mode = "SELECT_DEST"
+            self._set_msg("Click a node to set DESTINATION")
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
+
+        if k == "u":
+            self.cast = "UNICAST"
+            self._set_msg("Unicast selected. Set src/dst and press Enter.")
+            self._update_hud()
+            self.fig.canvas.draw_idle()
+            return
+
+        if k == "r":
+            self._reset_overlays(keep_src_dst=True)
+            return
+
+        if k in (" ", "space", "n"):
+            self.step_once()
+            return
+
+        if k in ("enter", "return"):
+            self.prepare_unicast()  # does NOT step
+            return
+
+    def prepare_unicast(self):
+        # clear dynamic overlays but keep src/dst markers
+        self._reset_overlays(keep_src_dst=True)
+
+        if self.src is None or self.dst is None:
+            self._set_msg("Set src and dst first (s + click, d + click).")
+            self.fig.canvas.draw_idle()
+            return
+
+        self.H = self._active_graph()
+
+        if self.src not in self.H or self.dst not in self.H:
+            self._set_msg("src/dst not in active graph.")
+            self.fig.canvas.draw_idle()
+            return
+
+        self.sim_active = True
+
+        if self.show_discovery:
+            # initialize BFS state, but DO NOT check any edge yet
+            self.sim_phase = "DISCOVERY"
+            self.bfs_q = deque([self.src])
+            self.bfs_parent = {self.src: None}
+            self.bfs_visited = {self.src}
+            self.bfs_checked_segments = []
+
+            # deterministic neighbor order
+            self.bfs_neighbors = {}
+            for u in self.H.nodes():
+                nbrs = sorted(list(self.H.neighbors(u)))  # stable base
+                # per-node deterministic seed based on cfg.seed and node name
+                seed_u = (int(self.cfg.seed) * 1000003) ^ zlib.adler32(str(u).encode("utf-8"))
+                rnd_u = random.Random(seed_u)
+                rnd_u.shuffle(nbrs)
+                self.bfs_neighbors[u] = nbrs
+            self.bfs_idx = {u: 0 for u in self.H.nodes()}
+
+            # show initial visited/frontier (optional)
+            self.visited_sc.set_offsets([self.pos[self.src]])
+            self.frontier_sc.set_offsets([self.pos[self.src]])
+            self._set_msg("Prepared DISCOVERY. Press Space to check next edge.")
+        else:
+            # skip discovery: compute path now, but DO NOT traverse any hop
+            try:
+                self.path = nx.shortest_path(self.H, self.src, self.dst)
+            except nx.NetworkXNoPath:
+                self.sim_phase = "DONE"
+                self.sim_active = False
+                self._set_msg("No path.")
+                self.fig.canvas.draw_idle()
+                return
+
+            self.sim_phase = "DELIVERY"
+            self.path_i = 0
+
+            # path background for context (optional)
+            segs = [(self.pos[self.path[i]], self.pos[self.path[i+1]]) for i in range(len(self.path)-1)]
+            self.path_bg.set_segments(segs)
+            self.path_fg.set_segments([])
+
+            # packet starts at src but we don't move yet
+            self.packet_sc.set_offsets([self.pos[self.path[0]]])
+
+            self._set_msg("Prepared DELIVERY. Press Space to traverse next hop.")
+
+        self._update_src_dst_markers()
+        self._update_hud()
+        self.fig.canvas.draw_idle()
+
+
+    def step_once(self):
+        if not self.sim_active or self.sim_phase in ("IDLE", "DONE"):
+            return
+
+        if self.sim_phase == "DISCOVERY":
+            self._step_discovery_one_edge()
+        elif self.sim_phase == "DELIVERY":
+            self._step_delivery_one_hop()
+
+        self.fig.canvas.draw_idle()
+
+
+    def _step_discovery_one_edge(self):
+        # find next node in queue that still has unchecked neighbors
+        while self.bfs_q:
+            u = self.bfs_q[0]
+            nbrs = self.bfs_neighbors[u]
+            i = self.bfs_idx[u]
+            if i < len(nbrs):
+                break
+            self.bfs_q.popleft()
+
+        if not self.bfs_q:
+            # BFS exhausted
+            self.sim_phase = "DONE"
+            self.sim_active = False
+            self.current_edge_lc.set_segments([])
+            self._set_msg("Discovery finished: destination unreachable (no path).")
+            return
+
+        u = self.bfs_q[0]
+        nbrs = self.bfs_neighbors[u]
+        i = self.bfs_idx[u]
+        v = nbrs[i]
+        self.bfs_idx[u] = i + 1
+
+        # "check" edge (u,v)
+        seg = (self.pos[u], self.pos[v])
+        self.bfs_checked_segments.append(seg)
+        self.checked_edges_lc.set_segments(self.bfs_checked_segments)
+        self.current_edge_lc.set_segments([seg])
+
+        # BFS relax / discover
+        if v not in self.bfs_visited:
+            self.bfs_visited.add(v)
+            self.bfs_parent[v] = u
+            self.bfs_q.append(v)
+
+        # update overlays: visited and frontier (= queue)
+        self.visited_sc.set_offsets([self.pos[n] for n in self.bfs_visited] if self.bfs_visited else self._empty_offsets())
+        self.frontier_sc.set_offsets([self.pos[n] for n in self.bfs_q] if self.bfs_q else self._empty_offsets())
+
+        # if reached destination, finalize path but don't move yet
+        if v == self.dst:
+            self.path = self._reconstruct_path(self.dst)
+            self.sim_phase = "DELIVERY"
+            self.path_i = 0
+
+            segs = [(self.pos[self.path[i]], self.pos[self.path[i+1]]) for i in range(len(self.path)-1)]
+            self.path_bg.set_segments(segs)
+            self.path_fg.set_segments([])
+            self.packet_sc.set_offsets([self.pos[self.path[0]]])
+
+            self.current_edge_lc.set_segments([])  # stop highlighting checks
+            self._set_msg("Path found. Press Space to traverse next hop (DELIVERY).")
+        else:
+            self._set_msg(f"Checked edge: {u} → {v}")
+
+    def _reconstruct_path(self, dst: str) -> List[str]:
+        path = []
+        cur = dst
+        while cur is not None:
+            path.append(cur)
+            cur = self.bfs_parent.get(cur)
+        path.reverse()
+        return path
+
+    def _step_delivery_one_hop(self):
+        if not self.path or len(self.path) == 1:
+            self.sim_phase = "DONE"
+            self.sim_active = False
+            self._set_msg("Trivial path (src==dst). Done.")
+            return
+
+        if self.path_i >= len(self.path) - 1:
+            self.sim_phase = "DONE"
+            self.sim_active = False
+            self._set_msg("Delivered. Done.")
+            return
+
+        a = self.path[self.path_i]
+        b = self.path[self.path_i + 1]
+
+        # move packet to next node
+        self.path_i += 1
+        self.packet_sc.set_offsets([self.pos[b]])
+
+        # extend highlighted delivered segments
+        segs_done = [(self.pos[self.path[i]], self.pos[self.path[i+1]]) for i in range(self.path_i)]
+        self.path_fg.set_segments(segs_done)
+
+        self._set_msg(f"Traversed hop: {a} → {b}")
+
+        self.frontier_sc.set_offsets(self._empty_offsets())
+        self.visited_sc.set_offsets(self._empty_offsets())
+
+    # ---------- unicast: frames ----------
+    def start_unicast(self):
+        self._reset_overlays(keep_src_dst=True)
+
+        if self.src is None or self.dst is None:
+            self._set_msg("Set src and dst first (press s/d, then click nodes).")
+            self.fig.canvas.draw_idle()
+            return
+
+        H = self._active_graph()
+
+        if self.src not in H or self.dst not in H:
+            self._set_msg("src/dst not in active graph.")
+            self.fig.canvas.draw_idle()
+            return
+
+        try:
+            # shortest path for delivery
+            path = nx.shortest_path(H, self.src, self.dst)
+        except nx.NetworkXNoPath:
+            self._set_msg("No path (graph disconnected or failures).")
+            self.fig.canvas.draw_idle()
+            return
+
+        # build discovery wave (BFS frontiers) until dst reached
+        discovery = self._bfs_discovery_frames(H, self.src, self.dst) if self.show_discovery else []
+        delivery = self._delivery_frames(path)
+        self.frames = discovery + delivery
+        self.frame_idx = 0
+        self.running = True
+        self.paused = False
+
+        # pre-draw full path background (for clarity)
+        segs = [(self.pos[path[i]], self.pos[path[i+1]]) for i in range(len(path)-1)]
+        self.path_bg.set_segments(segs)
+        self.path_fg.set_segments([])
+
+        # start timer
+        self.timer = self.fig.canvas.new_timer(interval=260)
+        self.timer.add_callback(self._advance_frame)
+        self.timer.start()
+
+        self._set_msg("Running unicast…")
+        self._update_src_dst_markers()
+        self._update_hud()
+        self.fig.canvas.draw_idle()
+
+    def _bfs_discovery_frames(self, H: nx.Graph, src: str, dst: str) -> List[dict]:
+        visited: Set[str] = set([src])
+        frontier: List[str] = [src]
+        frames: List[dict] = []
+
+        while frontier:
+            frames.append({
+                "phase": "DISCOVERY",
+                "frontier": list(frontier),
+                "visited": list(visited),
+            })
+            if dst in frontier:
+                break
+
+            nxt = []
+            for u in frontier:
+                for v in H.neighbors(u):
+                    if v not in visited:
+                        visited.add(v)
+                        nxt.append(v)
+            frontier = nxt
+
+        return frames
+
+    def _delivery_frames(self, path: List[str]) -> List[dict]:
+        frames: List[dict] = []
+        # packet starts at path[0], then moves each hop
+        for i in range(len(path)):
+            frames.append({
+                "phase": "DELIVERY",
+                "path": path,
+                "hop": i,  # index in path where packet is
+            })
+        return frames
+
+    def _advance_frame(self):
+        if not self.running:
+            return
+        if self.paused:
+            return
+
+        if self.frame_idx >= len(self.frames):
+            self.running = False
+            self._set_msg("Done.")
+            self.fig.canvas.draw_idle()
+            if self.timer is not None:
+                self.timer.stop()
+                self.timer = None
+            return
+
+        fr = self.frames[self.frame_idx]
+        self._render_frame(fr)
+        self.frame_idx += 1
+        self.fig.canvas.draw_idle()
+
+    def _render_frame(self, fr: dict):
+        if fr["phase"] == "DISCOVERY":
+            frontier_pts = [self.pos[n] for n in fr["frontier"]]
+            visited_pts = [self.pos[n] for n in fr["visited"]]
+
+            self.frontier_sc.set_offsets(frontier_pts if frontier_pts else [])
+            self.visited_sc.set_offsets(visited_pts if visited_pts else [])
+
+            # during discovery, no packet movement yet
+            self.packet_sc.set_offsets(self._empty_offsets())
+            self.path_fg.set_segments([])
+
+        elif fr["phase"] == "DELIVERY":
+            path = fr["path"]
+            hop = fr["hop"]
+
+            # hide discovery overlays
+            self.frontier_sc.set_offsets(self._empty_offsets())
+            self.visited_sc.set_offsets(self._empty_offsets())
+
+            # progress path highlight up to current hop
+            segs_done = []
+            for i in range(min(hop, len(path)-1)):
+                segs_done.append((self.pos[path[i]], self.pos[path[i+1]]))
+            self.path_fg.set_segments(segs_done)
+
+            # packet position
+            self.packet_sc.set_offsets([self.pos[path[hop]]])
+
+            if hop == len(path) - 1:
+                self._set_msg("Delivered.")
+
+
+
 if __name__ == "__main__":
     cfg = TopologyConfig(
         groups=6,
@@ -547,5 +1129,7 @@ if __name__ == "__main__":
     m = compute_metrics_ua(G, cfg, scope="all")
     print_metrics_ua(m, scope="all")
 
-    draw_topology_dragonflyish(G, pos, cfg)
+    viewer = UnicastViewer(G, pos, cfg)
+    plt.show()
+
 
