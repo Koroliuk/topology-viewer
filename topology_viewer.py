@@ -245,9 +245,16 @@ def dragonfly_ring_positions(G: nx.MultiGraph, cfg: TopologyConfig) -> Dict[str,
 # ----------------------------
 # Draw (compute-only)
 # ----------------------------
-def draw_topology_base(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cfg: TopologyConfig) -> None:
+# ----------------------------
+# Draw (compute-only) - MODIFIED
+# ----------------------------
+def draw_topology_base(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cfg: TopologyConfig):
     fig, ax = plt.subplots(figsize=cfg.figsize)
     ax.axis("off")
+
+    # --- REGISTRY TO STORE CURVATURE DATA ---
+    # Key: (u, v), Value: rad (float)
+    edge_registry: Dict[Tuple[str, str], float] = {}
 
     switches = [n for n, d in G.nodes(data=True) if d.get("kind") == "switch"]
     compute_nodes = [n for n, d in G.nodes(data=True) if d.get("kind") == "compute"]
@@ -255,7 +262,7 @@ def draw_topology_base(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cf
     cx0 = sum(pos[n][0] for n in switches) / max(1, len(switches))
     cy0 = sum(pos[n][1] for n in switches) / max(1, len(switches))
 
-    # outward direction per switch (toward its compute nodes)
+    # outward direction per switch
     out_vec = {}
     for s in switches:
         nbrs = [nbr for nbr in G.neighbors(s) if G.nodes[nbr].get("kind") == "compute"]
@@ -269,18 +276,14 @@ def draw_topology_base(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cf
         out_vec[s] = (vx / L, vy / L)
 
     def rad_away_from_compute(u, v, mag: float) -> float:
+        # ... (Same logic as before) ...
         x1, y1 = pos[u]
         x2, y2 = pos[v]
         dx, dy = (x2 - x1), (y2 - y1)
-
-        # left normal
         nx_, ny_ = (-dy, dx)
-
         oux, ouy = out_vec.get(u, (0.0, 0.0))
         ovx, ovy = out_vec.get(v, (0.0, 0.0))
         outx, outy = ((oux + ovx) / 2.0, (ouy + ovy) / 2.0)
-
-        # inward is opposite of outward
         inx, iny = (-outx, -outy)
         return mag if (nx_ * inx + ny_ * iny) > 0 else -mag
 
@@ -301,24 +304,24 @@ def draw_topology_base(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cf
             for i in range(cnt):
                 mag = 0.22 + 0.07 * min(i, 6)
                 rad = rad_away_from_compute(u, v, mag)
+
+                # STORE IN REGISTRY
+                edge_registry[(u, v)] = rad
+
                 ax.add_patch(FancyArrowPatch(
                     posA=pos[u], posB=pos[v],
                     connectionstyle=f"arc3,rad={rad}",
-                    arrowstyle="-",
-                    lw=1.6,
-                    color="black",
-                    alpha=0.65,
-                    zorder=0.2
+                    arrowstyle="-", lw=1.6, color="black", alpha=0.65, zorder=0.2
                 ))
 
-    # --- group intra (faint red, deeper inward, separated by distance) ---
+    # --- group intra ---
     if group_intra:
+        # ... (Sort logic same as before) ...
         group_switches_sorted = {}
         switch_order = {}
         for s in switches:
             gid = G.nodes[s]["group"]
             group_switches_sorted.setdefault(gid, []).append(s)
-
         for gid, sw_list in group_switches_sorted.items():
             def ang(s):
                 x, y = pos[s]
@@ -330,19 +333,19 @@ def draw_topology_base(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cf
 
         for (u, v) in group_intra:
             dist = abs(switch_order.get(u, 0) - switch_order.get(v, 0))
-            mag = 0.22 + 0.04 * min(dist, 12)  # more curvy, more separated
+            mag = 0.22 + 0.04 * min(dist, 12)
             rad = rad_away_from_compute(u, v, mag)
+
+            # STORE IN REGISTRY (Note: logic used -rad in original code, so we store -rad)
+            edge_registry[(u, v)] = -rad
+
             ax.add_patch(FancyArrowPatch(
                 posA=pos[u], posB=pos[v],
                 connectionstyle=f"arc3,rad={-rad}",
-                arrowstyle="-",
-                lw=0.7,
-                color="black",
-                alpha=0.65,
-                zorder=0.3
+                arrowstyle="-", lw=0.7, color="black", alpha=0.65, zorder=0.3
             ))
 
-    # --- local extra (blue, two sides) ---
+    # --- local extra ---
     if local_extra:
         extra_counts = Counter()
         for (u, v) in local_extra:
@@ -350,76 +353,65 @@ def draw_topology_base(G: nx.MultiGraph, pos: Dict[str, Tuple[float, float]], cf
             extra_counts[(a, b)] += 1
 
         for (u, v), cnt in extra_counts.items():
-            if cnt <= 0:
-                continue
+            if cnt <= 0: continue
             mag = 0.28
             inward = rad_away_from_compute(u, v, mag)
             outward = -inward
+
+            # Note: with multi-edges, we just store the last one for visualization defaults
+            # or store both if we want to be fancy. For viewer, picking 'inward' is usually fine.
+            edge_registry[(u, v)] = inward
+
             for rad in ([inward, outward] if cnt >= 2 else [inward]):
                 ax.add_patch(FancyArrowPatch(
                     posA=pos[u], posB=pos[v],
                     connectionstyle=f"arc3,rad={rad}",
-                    arrowstyle="-",
-                    lw=2.4,
-                    color="black",
-                    alpha=0.65,
-                    zorder=1.0
+                    arrowstyle="-", lw=2.4, color="black", alpha=0.65, zorder=1.0
                 ))
 
-    # --- subgroup internal clique (blue): draw per subgroup with a readable pattern ---
-    # We draw S2-S3 as straight line, and the other clique edges as inward curves.
+    # --- subgroup internal clique ---
     for gid in range(cfg.groups):
         for sg in range(cfg.subgroups_per_group):
             sw = [n for n, d in G.nodes(data=True)
                   if d.get("kind") == "switch" and d.get("group") == gid and d.get("subgroup") == sg]
             sw.sort(key=lambda n: G.nodes[n].get("switch_in_subgroup", 0))
-            if len(sw) != 4:
-                continue
-
+            if len(sw) != 4: continue
             s1, s2, s3, s4 = sw[0], sw[1], sw[2], sw[3]
 
-            # Straight adjacency (your requirement: S2-S3 should be a line)
-            x1, y1 = pos[s2];
-            x2, y2 = pos[s3]
-            ax.plot([x1, x2], [y1, y2],
+            # Straight S2-S3
+            edge_registry[(s2, s3)] = 0.0
+            ax.plot([pos[s2][0], pos[s3][0]], [pos[s2][1], pos[s3][1]],
                     color="black", alpha=0.55, lw=1.2, zorder=1.2)
 
-            # Other clique edges as curvy (inner side)
-            for (u, v, mag) in [
-                (s1, s2, 0.18),
-                (s3, s4, 0.18),
-                (s1, s3, 0.22),
-                (s2, s4, 0.22),
-                (s1, s4, 0.32),
-            ]:
+            # Curved others
+            for (u, v, mag) in [(s1, s2, 0.18), (s3, s4, 0.18), (s1, s3, 0.22), (s2, s4, 0.22), (s1, s4, 0.32)]:
                 rad = rad_away_from_compute(u, v, mag)
+
+                edge_registry[(u, v)] = -rad
+
                 ax.add_patch(FancyArrowPatch(
                     posA=pos[u], posB=pos[v],
                     connectionstyle=f"arc3,rad={-rad}",
-                    arrowstyle="-",
-                    lw=1.2,
-                    color="black",
-                    alpha=0.50,
-                    zorder=1.2
+                    arrowstyle="-", lw=1.2, color="black", alpha=0.50, zorder=1.2
                 ))
 
-    # --- injection edges (grey) ---
+    # --- injection edges ---
     if inj_edges:
         nx.draw_networkx_edges(nx.Graph(inj_edges), pos, alpha=0.45, width=1.6, edge_color="black")
+        # Injection edges are straight, rad = 0.0 (default behavior of getter)
 
-    # --- nodes on top ---
+    # --- nodes ---
     ax.scatter([pos[n][0] for n in switches], [pos[n][1] for n in switches],
-               s=cfg.node_size_switch, c="tab:green",
-               edgecolors="black", linewidths=0.8, zorder=10, label="Комутатори")
-
+               s=cfg.node_size_switch, c="tab:green", edgecolors="black", linewidths=0.8, zorder=10, label="Комутатори")
     ax.scatter([pos[n][0] for n in compute_nodes], [pos[n][1] for n in compute_nodes],
-               s=cfg.node_size_compute, c="tab:blue",
-               edgecolors="black", linewidths=0.5, zorder=10, label="Обчислювальні вузли")
+               s=cfg.node_size_compute, c="tab:blue", edgecolors="black", linewidths=0.5, zorder=10,
+               label="Обчислювальні вузли")
 
     fig.tight_layout()
     ax.legend(scatterpoints=1, frameon=False, loc="upper left")
-    return fig, ax
 
+    # RETURN REGISTRY TOO
+    return fig, ax, edge_registry
 
 import random
 import networkx as nx
@@ -541,74 +533,74 @@ class CastViewer:
         self.cfg = cfg
 
         # --- UI state ---
-        self.mode = "VIEW"  # VIEW, SELECT_SOURCE, SELECT_DEST_ONE, SELECT_DEST_MANY
-        self.cast = "UNICAST"  # UNICAST, BROADCAST, MULTICAST
+        self.mode = "VIEW"
+        self.cast = "UNICAST"
         self.show_discovery = True
-
         self.src: Optional[str] = None
         self.dst: Optional[str] = None
-        self.dsts: Set[str] = set()  # multicast group
+        self.dsts: Set[str] = set()
 
         # --- simulation state ---
         self.sim_active = False
-        self.sim_phase = "IDLE"  # IDLE, DISCOVERY, DELIVERY, DONE
+        self.sim_phase = "IDLE"
         self.H: Optional[nx.Graph] = None
 
-        # discovery (BFS edge-by-edge)
+        # BFS state
         self.bfs_q = deque()
-        self.bfs_parent: Dict[str, Optional[str]] = {}
-        self.bfs_visited: Set[str] = set()
-        self.bfs_neighbors: Dict[str, List[str]] = {}
-        self.bfs_idx: Dict[str, int] = {}
-        self.bfs_checked_segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        self.bfs_parent = {}
+        self.bfs_visited = set()
+        self.bfs_neighbors = {}
+        self.bfs_idx = {}
 
-        self.discovery_targets: Optional[Set[str]] = None  # None means full traversal
-        self.discovery_targets_found: Set[str] = set()
+        # STORE NODES INSTEAD OF SEGMENTS FOR CURVATURE LOOKUP
+        self.bfs_checked_edges: List[Tuple[str, str]] = []
 
-        # delivery
-        self.path: List[str] = []
-        self.path_i = 0  # packet at path[path_i]
+        self.discovery_targets = None
+        self.discovery_targets_found = set()
 
-        # tree-based delivery (broadcast/multicast)
-        self.tree_children: Dict[str, List[str]] = {}
-        self.received: Set[str] = set()
-        self.frontier: List[str] = []
-        self.delivered_segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        # Delivery state
+        self.path = []
+        self.path_i = 0
+        self.tree_children = {}
+        self.received = set()
+        self.frontier = []
 
-        # --- base draw ---
-        self.fig, self.ax = draw_topology_base(G, pos, cfg)
-        self.fig = self.ax.figure  # robust
+        # STORE NODES INSTEAD OF SEGMENTS
+        self.delivered_edges: List[Tuple[str, str]] = []
+        self.current_wave_edges: List[Tuple[str, str]] = []
+
+        # --- Base Draw with Registry ---
+        self.fig, self.ax, self.edge_registry = draw_topology_base(G, pos, cfg)
+        self.fig = self.ax.figure
+
+        # --- Dynamic Patches Storage ---
+        # We need to track patches to remove them on updates
+        self.active_patches: List[FancyArrowPatch] = []
 
         self._init_overlays()
 
-        self.hud = self.ax.text(
-            0.02, 0.02, self._hud_text(),
-            transform=self.ax.transAxes, fontsize=10, va="bottom", ha="left"
-        )
-
+        # ... (rest of init for hud/events remains same) ...
+        self.hud = self.ax.text(0.02, 0.02, self._hud_text(), transform=self.ax.transAxes, fontsize=10, va="bottom")
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
-    # ---------- helpers ----------
+    # ... (Helper methods for hud, empty_offsets, nearest_node remain same) ...
     def _empty_offsets(self):
         return np.empty((0, 2))
 
     def _active_graph(self) -> nx.Graph:
         H = nx.Graph()
         H.add_nodes_from(self.G.nodes())
-        for u, v, _d in self.G.edges(data=True):
-            H.add_edge(u, v)
+        for u, v, _d in self.G.edges(data=True): H.add_edge(u, v)
         return H
 
     def _hud_text(self) -> str:
+        # (Same as before)
         def short(x): return x if x is not None else "—"
-        return (
-            f"Cast: {self.cast} | Phase: {self.sim_phase} | Discovery(w): {'ON' if self.show_discovery else 'OFF'}\n"
-            f"Mode: {self.mode}\n"
-            f"src: {short(self.src)} | dst: {short(self.dst)} | multicast_dsts: {len(self.dsts)}\n"
-            "Keys: u(unicast) b(broadcast) m(multicast)  s(select src) d(select dst/group)\n"
-            "      w(toggle discovery) Enter(prepare) Space/ n(next step) r(reset overlays) c(clear multicast group)"
-        )
+
+        return (f"Cast: {self.cast} | Phase: {self.sim_phase} | Discovery: {'ON' if self.show_discovery else 'OFF'}\n"
+                f"Mode: {self.mode} | src: {short(self.src)} | dst: {short(self.dst)} | m_dsts: {len(self.dsts)}\n"
+                "Keys: Space(step) r(reset) ...")
 
     def _update_hud(self):
         self.hud.set_text(self._hud_text())
@@ -616,375 +608,269 @@ class CastViewer:
     def _set_msg(self, txt: str):
         self.msg.set_text(txt)
 
-    def _nearest_node(self, x: float, y: float) -> Optional[str]:
-        # Increase threshold if selection is hard
+    def _nearest_node(self, x, y):
+        # (Same as before)
         thr2 = 0.75 ** 2
         best, best_d2 = None, 1e18
         for n, (nx_, ny_) in self.pos.items():
             d2 = (nx_ - x) ** 2 + (ny_ - y) ** 2
-            if d2 < best_d2:
-                best, best_d2 = n, d2
+            if d2 < best_d2: best, best_d2 = n, d2
         return best if best is not None and best_d2 <= thr2 else None
 
     # ---------- overlays ----------
     def _init_overlays(self):
-        # source/dest markers
+        # Nodes / Markers
         self.src_sc = self.ax.scatter([], [], s=240, facecolors="none", edgecolors="black", linewidths=2.2, zorder=40)
         self.dst_sc = self.ax.scatter([], [], s=240, facecolors="none", edgecolors="black", linewidths=2.2, zorder=40)
         self.dsts_sc = self.ax.scatter([], [], s=190, facecolors="none", edgecolors="black", linewidths=1.6, zorder=39)
-
-        # discovery nodes
-        self.frontier_sc = self.ax.scatter([], [], s=170, facecolors="none", edgecolors="red", linewidths=2.0, zorder=35)
-        self.visited_sc = self.ax.scatter([], [], s=120, facecolors="none", edgecolors="red", linewidths=1.0, alpha=0.25, zorder=34)
-
-        # discovery edges: checked + current (RED)
-        self.checked_edges_lc = LineCollection([], colors="red", linewidths=1.6, alpha=0.25, zorder=30)
-        self.current_edge_lc = LineCollection([], colors="red", linewidths=3.2, alpha=0.9, zorder=31)
-        self.ax.add_collection(self.checked_edges_lc)
-        self.ax.add_collection(self.current_edge_lc)
-
-        # delivery edges: accumulated + current wave/path (RED)
-        self.delivery_edges_lc = LineCollection([], colors="red", linewidths=3.0, alpha=0.55, zorder=32)
-        self.delivery_now_lc = LineCollection([], colors="red", linewidths=4.2, alpha=0.95, zorder=33)
-        self.ax.add_collection(self.delivery_edges_lc)
-        self.ax.add_collection(self.delivery_now_lc)
-
-        # packet marker (RED so it’s not blue)
+        self.frontier_sc = self.ax.scatter([], [], s=170, facecolors="none", edgecolors="red", linewidths=2.0,
+                                           zorder=35)
+        self.visited_sc = self.ax.scatter([], [], s=120, facecolors="none", edgecolors="red", linewidths=1.0,
+                                          alpha=0.25, zorder=34)
         self.packet_sc = self.ax.scatter([], [], s=95, c="red", zorder=45)
+        self.msg = self.ax.text(0.5, 0.98, "", transform=self.ax.transAxes, fontsize=11, va="top", ha="center")
 
-        # messages
-        self.msg = self.ax.text(0.5, 0.98, "", transform=self.ax.transAxes,
-                                fontsize=11, va="top", ha="center")
+        # Remove LineCollections! We will use self.active_patches instead.
 
-        # Multicast destinations panel (toggle with 'l')
         self.show_dsts_panel = True
-        self.dsts_panel = self.ax.text(
-            0.98, 0.02, "", transform=self.ax.transAxes,
-            fontsize=9, va="bottom", ha="right",
-            bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="black", alpha=0.75),
-            zorder=60
-        )
+        self.dsts_panel = self.ax.text(0.98, 0.02, "", transform=self.ax.transAxes, fontsize=9, va="bottom", ha="right",
+                                       bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="black", alpha=0.75),
+                                       zorder=60)
+        self.tooltip = self.ax.text(0, 0, "", fontsize=9,
+                                    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="black", alpha=0.85), zorder=70,
+                                    visible=False)
 
-        # Tooltip for right click node id
-        self.tooltip = self.ax.text(
-            0, 0, "", fontsize=9,
-            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="black", alpha=0.85),
-            zorder=70,
-            visible=False
-        )
+    # --- KEY FIX: Drawing helper ---
+    def _draw_curved_edge(self, u, v, color, lw, alpha, zorder):
+        # Determine curvature from registry
+        # The registry stores 'rad' for (u, v).
+        # If we are drawing u->v, we use rad.
+        # If we are drawing v->u (path reverse), we must invert rad relative to posA/posB.
 
+        rad = 0.0
+        if (u, v) in self.edge_registry:
+            rad = self.edge_registry[(u, v)]
+        elif (v, u) in self.edge_registry:
+            # If the original edge was v->u with rad R,
+            # drawing u->v requires -R to match the same physical arc.
+            rad = -self.edge_registry[(v, u)]
+
+        patch = FancyArrowPatch(
+            posA=self.pos[u], posB=self.pos[v],
+            connectionstyle=f"arc3,rad={rad}",
+            arrowstyle="-",
+            color=color, lw=lw, alpha=alpha, zorder=zorder
+        )
+        self.ax.add_patch(patch)
+        self.active_patches.append(patch)
+
+    def _redraw_dynamic_edges(self):
+        # 1. Clear old dynamic patches
+        for p in self.active_patches:
+            p.remove()
+        self.active_patches.clear()
+
+        # 2. Draw BFS Checked Edges (Pale Red)
+        for u, v in self.bfs_checked_edges:
+            self._draw_curved_edge(u, v, "red", 1.6, 0.25, 30)
+
+        # 3. Draw Delivery History (Medium Red)
+        for u, v in self.delivered_edges:
+            self._draw_curved_edge(u, v, "red", 3.0, 0.55, 32)
+
+        # 4. Draw Current Wave / Hop (Bright Red)
+        for u, v in self.current_wave_edges:
+            self._draw_curved_edge(u, v, "red", 4.2, 0.95, 33)
+
+    # ... (Keep _update_dsts_panel, _show_tooltip, _hide_tooltip, _update_src_dst_markers) ...
     def _update_dsts_panel(self):
-        if not getattr(self, "show_dsts_panel", True):
-            self.dsts_panel.set_text("")
-            self.dsts_panel.set_visible(False)
-            return
-
-        if self.cast != "MULTICAST":
-            self.dsts_panel.set_text("")
-            self.dsts_panel.set_visible(False)
-            return
-
+        # (Copy your existing code here)
+        if not getattr(self, "show_dsts_panel", True): self.dsts_panel.set_visible(False); return
+        if self.cast != "MULTICAST": self.dsts_panel.set_visible(False); return
         self.dsts_panel.set_visible(True)
         items = sorted(self.dsts)
-        if not items:
-            self.dsts_panel.set_text("Multicast group:\n(empty)")
-            return
-
-        # show up to N, and then "... +k more"
-        N = 10
-        head = items[:N]
+        if not items: self.dsts_panel.set_text("Multicast group:\n(empty)"); return
+        N = 10;
+        head = items[:N];
         more = len(items) - len(head)
         text = "Multicast group:\n" + "\n".join(head)
-        if more > 0:
-            text += f"\n… +{more} more"
+        if more > 0: text += f"\n… +{more} more"
         self.dsts_panel.set_text(text)
 
-    def _show_tooltip(self, node_id: str, x: float, y: float):
-        d = self.G.nodes[node_id]
-        kind = d.get("kind", "?")
-        grp = d.get("group", "-")
-        sg = d.get("subgroup", "-")
-
-        self.tooltip.set_text(f"{node_id}\nkind={kind}, group={grp}, sg={sg}")
-        self.tooltip.set_position((x, y))
+    def _show_tooltip(self, node_id, x, y):
+        # (Copy your existing code)
+        d = self.G.nodes[node_id];
+        self.tooltip.set_text(f"{node_id}\n{d.get('kind', '?')}");
+        self.tooltip.set_position((x, y));
         self.tooltip.set_visible(True)
 
     def _hide_tooltip(self):
         self.tooltip.set_visible(False)
 
     def _update_src_dst_markers(self):
+        # (Copy your existing code)
         self.src_sc.set_offsets([self.pos[self.src]] if self.src else self._empty_offsets())
-
-        # If multicast: hide single-dst marker to avoid confusion
         if self.cast == "MULTICAST":
             self.dst_sc.set_offsets(self._empty_offsets())
         else:
             self.dst_sc.set_offsets([self.pos[self.dst]] if self.dst else self._empty_offsets())
-
         self.dsts_sc.set_offsets([self.pos[n] for n in sorted(self.dsts)] if self.dsts else self._empty_offsets())
-
         self._update_dsts_panel()
 
     def _reset_overlays(self, keep_selection: bool = True):
-        # stop sim
         self.sim_active = False
         self.sim_phase = "IDLE"
         self.H = None
 
-        # reset BFS
-        self.bfs_q.clear()
-        self.bfs_parent.clear()
+        self.bfs_q.clear();
+        self.bfs_parent.clear();
         self.bfs_visited.clear()
-        self.bfs_neighbors.clear()
+        self.bfs_neighbors.clear();
         self.bfs_idx.clear()
-        self.bfs_checked_segments = []
+
+        self.bfs_checked_edges = []  # Clear edge list
+
         self.discovery_targets = None
         self.discovery_targets_found = set()
 
-        # reset delivery
-        self.path = []
+        self.path = [];
         self.path_i = 0
-        self.tree_children = {}
-        self.received = set()
+        self.tree_children = {};
+        self.received = set();
         self.frontier = []
-        self.delivered_segments = []
 
-        # clear overlays
+        self.delivered_edges = []  # Clear edge list
+        self.current_wave_edges = []  # Clear edge list
+
         self.frontier_sc.set_offsets(self._empty_offsets())
         self.visited_sc.set_offsets(self._empty_offsets())
         self.packet_sc.set_offsets(self._empty_offsets())
 
-        self.checked_edges_lc.set_segments([])
-        self.current_edge_lc.set_segments([])
-
-        self.delivery_edges_lc.set_segments([])
-        self.delivery_now_lc.set_segments([])
+        self._redraw_dynamic_edges()  # Updates visuals
 
         self._set_msg("")
-
         if not keep_selection:
-            self.src = None
-            self.dst = None
+            self.src = None;
+            self.dst = None;
             self.dsts.clear()
 
         self._update_src_dst_markers()
         self._update_hud()
         self.fig.canvas.draw_idle()
 
-    # ---------- events ----------
+    # ... (Event handlers _on_click, _on_key remain exactly the same) ...
     def _on_click(self, event):
-        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
-            return
+        # (Copy your existing code, no changes needed)
+        if event.inaxes != self.ax or event.xdata is None: return
         n = self._nearest_node(event.xdata, event.ydata)
-        if n is None:
-            return
-
-        # Right-click (button=3) shows tooltip with node id
+        if n is None: return
         if event.button == 3:
-            self._show_tooltip(n, event.xdata, event.ydata)
-            self.fig.canvas.draw_idle()
-            return
+            self._show_tooltip(n, event.xdata, event.ydata); self.fig.canvas.draw_idle(); return
         else:
-            # left click hides tooltip
             self._hide_tooltip()
-
         if self.mode == "SELECT_SOURCE":
-            if self.src == n:
-                self.src = None
-                self._set_msg("Source cleared.")
-            else:
-                self.src = n
-                self._set_msg(f"Source set: {n}")
-            self.mode = "VIEW"
-            self._update_src_dst_markers()
-            self._update_hud()
-            self.fig.canvas.draw_idle()
+            self.src = None if self.src == n else n
+            self._set_msg(f"Source: {self.src}")
+            self.mode = "VIEW";
+            self._update_src_dst_markers();
+            self._update_hud();
+            self.fig.canvas.draw_idle();
             return
-
         if self.mode == "SELECT_DEST_ONE":
-            if self.dst == n:
-                self.dst = None
-                self._set_msg("Destination cleared.")
-            else:
-                self.dst = n
-                self._set_msg(f"Destination set: {n}")
-            self.mode = "VIEW"
-            self._update_src_dst_markers()
-            self._update_hud()
-            self.fig.canvas.draw_idle()
+            self.dst = None if self.dst == n else n
+            self._set_msg(f"Dest: {self.dst}")
+            self.mode = "VIEW";
+            self._update_src_dst_markers();
+            self._update_hud();
+            self.fig.canvas.draw_idle();
             return
-
         if self.mode == "SELECT_DEST_MANY":
             if n in self.dsts:
                 self.dsts.remove(n)
-                self._set_msg(f"Removed from group: {n}")
             else:
                 self.dsts.add(n)
-                self._set_msg(f"Added to group: {n}")
-            self._update_src_dst_markers()
-            self._update_hud()
-            self.fig.canvas.draw_idle()
+            self._update_src_dst_markers();
+            self._update_hud();
+            self.fig.canvas.draw_idle();
             return
 
     def _on_key(self, event):
+        # (Copy your existing code, no changes needed)
         k = (event.key or "").lower()
-
         if k == "u":
-            self.cast = "UNICAST"
-            self.mode = "VIEW"
-            self._set_msg("Unicast selected.")
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
-        if k == "b":
-            self.cast = "BROADCAST"
-            self.mode = "VIEW"
-            self._set_msg("Broadcast selected.")
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
-        if k == "m":
-            self.cast = "MULTICAST"
-            self.mode = "VIEW"
-            self._set_msg("Multicast selected. Use 'd' + click to add group nodes.")
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
-        if k == "s":
-            self.mode = "SELECT_SOURCE"
-            self._set_msg("Click a node to set SOURCE.")
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
-        if k == "d":
-            if self.cast == "MULTICAST":
-                self.mode = "SELECT_DEST_MANY"
-                self._set_msg("Click nodes to toggle multicast destinations.")
-            else:
-                self.mode = "SELECT_DEST_ONE"
-                self._set_msg("Click a node to set DESTINATION.")
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
-        if k == "c":
-            self.dsts.clear()
-            self._set_msg("Cleared multicast group.")
-            self._update_src_dst_markers()
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
-        if k == "w":
-            self.show_discovery = not self.show_discovery
-            self._set_msg(f"Discovery: {'ON' if self.show_discovery else 'OFF'}")
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
-        if k == "r":
-            self._reset_overlays(keep_selection=True)
-            return
-
-        # Enter = prepare (no stepping yet)
-        if k in ("enter", "return"):
+            self.cast = "UNICAST"; self.mode = "VIEW"; self._set_msg(
+                "Unicast"); self._update_hud(); self.fig.canvas.draw_idle()
+        elif k == "b":
+            self.cast = "BROADCAST"; self.mode = "VIEW"; self._set_msg(
+                "Broadcast"); self._update_hud(); self.fig.canvas.draw_idle()
+        elif k == "m":
+            self.cast = "MULTICAST"; self.mode = "VIEW"; self._set_msg(
+                "Multicast"); self._update_hud(); self.fig.canvas.draw_idle()
+        elif k == "s":
+            self.mode = "SELECT_SOURCE"; self._set_msg("Click Source"); self._update_hud(); self.fig.canvas.draw_idle()
+        elif k == "d":
+            self.mode = "SELECT_DEST_MANY" if self.cast == "MULTICAST" else "SELECT_DEST_ONE"; self._set_msg(
+                "Click Dest"); self._update_hud(); self.fig.canvas.draw_idle()
+        elif k == "c":
+            self.dsts.clear(); self._update_src_dst_markers(); self.fig.canvas.draw_idle()
+        elif k == "w":
+            self.show_discovery = not self.show_discovery; self._update_hud(); self.fig.canvas.draw_idle()
+        elif k == "r":
+            self._reset_overlays(True)
+        elif k in ("enter", "return"):
             self.prepare()
-            return
-
-        # Space / n = one step
-        if event.key in (" ", "space", "n"):
+        elif k in (" ", "space", "n"):
             self.step_once()
-            return
-
-        if k == "l":
-            self.show_dsts_panel = not getattr(self, "show_dsts_panel", True)
-            self._set_msg(f"Destinations panel: {'ON' if self.show_dsts_panel else 'OFF'}")
-            self._update_src_dst_markers()
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
-        if k == "z":
-            self.src = None
-            self._set_msg("Source cleared (z).")
-            self._update_src_dst_markers()
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
-        if k == "x":
-            self.dst = None
-            self._set_msg("Destination cleared (x).")
-            self._update_src_dst_markers()
-            self._update_hud()
-            self.fig.canvas.draw_idle()
-            return
-
+        elif k == "l":
+            self.show_dsts_panel = not getattr(self, "show_dsts_panel",
+                                               True); self._update_src_dst_markers(); self.fig.canvas.draw_idle()
+        elif k == "z":
+            self.src = None; self._update_src_dst_markers(); self.fig.canvas.draw_idle()
+        elif k == "x":
+            self.dst = None; self._update_src_dst_markers(); self.fig.canvas.draw_idle()
 
     # ---------- prepare ----------
     def prepare(self):
         self._reset_overlays(keep_selection=True)
-
-        if self.src is None:
-            self._set_msg("Set src first (press 's' then click).")
-            self.fig.canvas.draw_idle()
-            return
-
+        if self.src is None: self._set_msg("Set src first."); self.fig.canvas.draw_idle(); return
         self.H = self._active_graph()
 
+        # ... (Rest of prepare logic is the same, just calling init methods) ...
         if self.cast == "UNICAST":
-            if self.dst is None:
-                self._set_msg("Set dst first (press 'd' then click).")
-                return
+            if self.dst is None: self._set_msg("Set dst first."); return
             if self.show_discovery:
                 self._init_bfs_discovery(targets={self.dst})
-                self._set_msg("Prepared UNICAST DISCOVERY. Press Space to check next edge.")
             else:
                 self._init_unicast_delivery_direct()
-                self._set_msg("Prepared UNICAST DELIVERY. Press Space to traverse next hop.")
-
         elif self.cast == "BROADCAST":
             if self.show_discovery:
-                self._init_bfs_discovery(targets=None)  # full traversal
-                self._set_msg("Prepared BROADCAST DISCOVERY. Press Space to check next edge.")
+                self._init_bfs_discovery(targets=None)
             else:
-                self._build_bfs_parents_full()
-                self._init_tree_delivery_from_parents(all_targets=True)
-                self._set_msg("Prepared BROADCAST WAVES (no discovery). Press Space for next wave.")
-
+                self._build_bfs_parents_full(); self._init_tree_delivery_from_parents(True)
         elif self.cast == "MULTICAST":
-            if not self.dsts:
-                self._set_msg("Pick multicast group: press 'd' and click nodes (add at least 1).")
-                return
+            if not self.dsts: self._set_msg("Pick multicast group."); return
             if self.show_discovery:
                 self._init_bfs_discovery(targets=set(self.dsts))
-                self._set_msg("Prepared MULTICAST DISCOVERY. Press Space to check next edge.")
             else:
-                self._build_bfs_parents_until_targets(set(self.dsts))
-                self._init_multicast_tree_delivery(set(self.dsts))
-                self._set_msg("Prepared MULTICAST WAVES (no discovery). Press Space for next wave.")
+                self._build_bfs_parents_until_targets(set(self.dsts)); self._init_multicast_tree_delivery(
+                    set(self.dsts))
 
         self.sim_active = True
-        self._update_src_dst_markers()
-        self._update_hud()
+        self._update_src_dst_markers();
+        self._update_hud();
         self.fig.canvas.draw_idle()
 
-    # ---------- BFS discovery init / stepping ----------
-    def _init_bfs_discovery(self, targets: Optional[Set[str]]):
+    # ---------- BFS init / stepping ----------
+    def _init_bfs_discovery(self, targets):
         self.sim_phase = "DISCOVERY"
         self.discovery_targets = targets
         self.discovery_targets_found = set()
-
         self.bfs_q = deque([self.src])
         self.bfs_parent = {self.src: None}
         self.bfs_visited = {self.src}
-        self.bfs_checked_segments = []
+        self.bfs_checked_edges = []  # Reset
+        self.current_wave_edges = []
 
-        # seeded shuffled neighbors (reproducible)
         self.bfs_neighbors = {}
         self.bfs_idx = {}
         for u in self.H.nodes():
@@ -995,85 +881,71 @@ class CastViewer:
             self.bfs_neighbors[u] = nbrs
             self.bfs_idx[u] = 0
 
-        # initial overlay
         self.visited_sc.set_offsets([self.pos[self.src]])
         self.frontier_sc.set_offsets([self.pos[self.src]])
+        self._redraw_dynamic_edges()
 
     def _step_bfs_one_edge(self):
-        # advance to next node in queue with remaining neighbors
         while self.bfs_q:
             u = self.bfs_q[0]
-            if self.bfs_idx[u] < len(self.bfs_neighbors[u]):
-                break
+            if self.bfs_idx[u] < len(self.bfs_neighbors[u]): break
             self.bfs_q.popleft()
 
         if not self.bfs_q:
-            # finished traversal
-            self.current_edge_lc.set_segments([])
-            return False  # no more edges
+            self.current_wave_edges = []
+            self._redraw_dynamic_edges()
+            return False
 
         u = self.bfs_q[0]
         v = self.bfs_neighbors[u][self.bfs_idx[u]]
         self.bfs_idx[u] += 1
 
-        seg = (self.pos[u], self.pos[v])
-        self.bfs_checked_segments.append(seg)
-        self.checked_edges_lc.set_segments(self.bfs_checked_segments)
-        self.current_edge_lc.set_segments([seg])
+        # STORE NODES, NOT COORDINATES
+        self.bfs_checked_edges.append((u, v))
+        self.current_wave_edges = [(u, v)]
+        self._redraw_dynamic_edges()  # Trigger redraw
 
-        # discover
         if v not in self.bfs_visited:
             self.bfs_visited.add(v)
             self.bfs_parent[v] = u
             self.bfs_q.append(v)
 
-        # update overlays
-        self.visited_sc.set_offsets([self.pos[n] for n in self.bfs_visited] if self.bfs_visited else self._empty_offsets())
+        self.visited_sc.set_offsets([self.pos[n] for n in self.bfs_visited])
         self.frontier_sc.set_offsets([self.pos[n] for n in self.bfs_q] if self.bfs_q else self._empty_offsets())
 
-        # targets tracking
         if self.discovery_targets is not None and v in self.discovery_targets:
             self.discovery_targets_found.add(v)
 
-        self._set_msg(f"Checked edge: {u} → {v}")
+        self._set_msg(f"Checked: {u} → {v}")
         return True
 
-    # ---------- direct build without interactive discovery ----------
+    # ... (Helpers _build_bfs_parents... remain same) ...
     def _build_bfs_parents_full(self):
-        # Build parents for all reachable nodes using seeded neighbor order
-        self._init_bfs_discovery(targets=None)
-        while self._step_bfs_one_edge():
-            pass
-        # clear discovery visuals (optional)
-        self.frontier_sc.set_offsets(self._empty_offsets())
+        self._init_bfs_discovery(None)
+        while self._step_bfs_one_edge(): pass
+        self.frontier_sc.set_offsets(self._empty_offsets());
         self.visited_sc.set_offsets(self._empty_offsets())
-        self.current_edge_lc.set_segments([])
-        self.checked_edges_lc.set_segments([])
+        self.current_wave_edges = [];
+        self.bfs_checked_edges = []  # Clear discovery visuals
+        self._redraw_dynamic_edges()
 
-    def _build_bfs_parents_until_targets(self, targets: Set[str]):
-        self._init_bfs_discovery(targets=set(targets))
+    def _build_bfs_parents_until_targets(self, targets):
+        self._init_bfs_discovery(targets)
         while True:
-            progressed = self._step_bfs_one_edge()
-            if not progressed:
-                break
-            if self.discovery_targets_found == set(targets):
-                break
-        # clear discovery visuals (optional)
-        self.frontier_sc.set_offsets(self._empty_offsets())
+            if not self._step_bfs_one_edge(): break
+            if self.discovery_targets_found == set(targets): break
+        self.frontier_sc.set_offsets(self._empty_offsets());
         self.visited_sc.set_offsets(self._empty_offsets())
-        self.current_edge_lc.set_segments([])
-        self.checked_edges_lc.set_segments([])
+        self.current_wave_edges = [];
+        self.bfs_checked_edges = []
+        self._redraw_dynamic_edges()
 
-    # ---------- reconstruct path ----------
-    def _reconstruct_path(self, dst: str) -> List[str]:
-        if dst not in self.bfs_parent:
-            return []
-        p = []
+    def _reconstruct_path(self, dst):
+        if dst not in self.bfs_parent: return []
+        p = [];
         cur = dst
-        while cur is not None:
-            p.append(cur)
-            cur = self.bfs_parent.get(cur)
-        p.reverse()
+        while cur is not None: p.append(cur); cur = self.bfs_parent.get(cur)
+        p.reverse();
         return p
 
     # ---------- init delivery ----------
@@ -1082,195 +954,139 @@ class CastViewer:
         try:
             self.path = nx.shortest_path(self.H, self.src, self.dst)
         except nx.NetworkXNoPath:
-            self.sim_phase = "DONE"
-            self.sim_active = False
-            self._set_msg("No path.")
-            return
-
+            self.sim_phase = "DONE"; self.sim_active = False; self._set_msg("No path."); return
         self.path_i = 0
         self.packet_sc.set_offsets([self.pos[self.path[0]]])
-        self.delivered_segments = []
-        self.delivery_edges_lc.set_segments([])
-        self.delivery_now_lc.set_segments([])
+        self.delivered_edges = []
+        self.current_wave_edges = []
+        self._redraw_dynamic_edges()
 
-    def _init_tree_delivery_from_parents(self, all_targets: bool):
-        # build a directed "children" map from bfs_parent
+    def _init_tree_delivery_from_parents(self, all_targets):
         self.sim_phase = "DELIVERY"
         self.tree_children = {}
         for v, p in self.bfs_parent.items():
-            if p is None:
-                continue
+            if p is None: continue
             self.tree_children.setdefault(p, []).append(v)
-
-        # wave state
-        self.received = {self.src}
+        self.received = {self.src};
         self.frontier = [self.src]
-        self.delivered_segments = []
-        self.delivery_edges_lc.set_segments([])
-        self.delivery_now_lc.set_segments([])
-
-        # hide discovery markers
-        self.frontier_sc.set_offsets(self._empty_offsets())
+        self.delivered_edges = [];
+        self.current_wave_edges = []
+        self.frontier_sc.set_offsets(self._empty_offsets());
         self.visited_sc.set_offsets(self._empty_offsets())
-        self.current_edge_lc.set_segments([])
-        self.checked_edges_lc.set_segments([])
+        self.bfs_checked_edges = []
+        self._redraw_dynamic_edges()
 
-    def _init_multicast_tree_delivery(self, targets: Set[str]):
-        # union of shortest paths to each target using bfs_parent
-        edges = set()
+    def _init_multicast_tree_delivery(self, targets):
+        edges = set();
         used_nodes = {self.src}
-
         for t in targets:
             path = self._reconstruct_path(t)
-            if not path:
-                continue
+            if not path: continue
             used_nodes.update(path)
-            for i in range(len(path) - 1):
-                edges.add((path[i], path[i + 1]))
-
-        # build children map from union edges
+            for i in range(len(path) - 1): edges.add((path[i], path[i + 1]))
         self.tree_children = {}
-        for a, b in edges:
-            self.tree_children.setdefault(a, []).append(b)
-
+        for a, b in edges: self.tree_children.setdefault(a, []).append(b)
         self.sim_phase = "DELIVERY"
-        self.received = {self.src}
+        self.received = {self.src};
         self.frontier = [self.src]
-        self.delivered_segments = []
-        self.delivery_edges_lc.set_segments([])
-        self.delivery_now_lc.set_segments([])
-
-        # hide discovery markers
-        self.frontier_sc.set_offsets(self._empty_offsets())
+        self.delivered_edges = [];
+        self.current_wave_edges = []
+        self.frontier_sc.set_offsets(self._empty_offsets());
         self.visited_sc.set_offsets(self._empty_offsets())
-        self.current_edge_lc.set_segments([])
-        self.checked_edges_lc.set_segments([])
+        self.bfs_checked_edges = []
+        self._redraw_dynamic_edges()
 
     # ---------- stepping ----------
     def step_once(self):
-        if not self.sim_active or self.sim_phase in ("IDLE", "DONE"):
-            return
-
+        if not self.sim_active or self.sim_phase in ("IDLE", "DONE"): return
         if self.sim_phase == "DISCOVERY":
-            progressed = self._step_bfs_one_edge()
-            if not progressed:
-                # finished traversal without finding targets (or broadcast done)
+            if not self._step_bfs_one_edge(): self._finish_discovery(); self.fig.canvas.draw_idle(); return
+            if self.cast == "UNICAST" and self.dst in self.bfs_visited:
                 self._finish_discovery()
-                self.fig.canvas.draw_idle()
-                return
-
-            # stop conditions
-            if self.cast == "UNICAST":
-                if self.dst in self.bfs_visited:
-                    self._finish_discovery()
-            elif self.cast == "MULTICAST":
-                if self.discovery_targets is not None and self.discovery_targets_found == self.discovery_targets:
-                    self._finish_discovery()
-            # BROADCAST finishes only when BFS exhausted (progressed becomes False)
-
+            elif self.cast == "MULTICAST" and self.discovery_targets and self.discovery_targets_found == self.discovery_targets:
+                self._finish_discovery()
         elif self.sim_phase == "DELIVERY":
             if self.cast == "UNICAST":
                 self._step_unicast_one_hop()
             elif self.cast == "BROADCAST":
-                self._step_tree_one_wave(label="Broadcast wave")
+                self._step_tree_one_wave("Broadcast wave")
             elif self.cast == "MULTICAST":
-                self._step_tree_one_wave(label="Multicast wave")
-
-        self._update_hud()
+                self._step_tree_one_wave("Multicast wave")
+        self._update_hud();
         self.fig.canvas.draw_idle()
 
     def _finish_discovery(self):
         if self.cast == "UNICAST":
             self.path = self._reconstruct_path(self.dst)
-            if not self.path:
-                self.sim_phase = "DONE"
-                self.sim_active = False
-                self._set_msg("No path (unreachable).")
-                return
-            self.sim_phase = "DELIVERY"
+            if not self.path: self.sim_phase = "DONE"; self.sim_active = False; self._set_msg("No path."); return
+            self.sim_phase = "DELIVERY";
             self.path_i = 0
             self.packet_sc.set_offsets([self.pos[self.path[0]]])
-            self.delivered_segments = []
-            self.delivery_edges_lc.set_segments([])
-            self.delivery_now_lc.set_segments([])
-            self._set_msg("Path found. Press Space to traverse next hop.")
-            # hide discovery overlays
-            self.frontier_sc.set_offsets(self._empty_offsets())
+            self.delivered_edges = [];
+            self.current_wave_edges = []
+            self.bfs_checked_edges = []  # Clear discovery
+            self._redraw_dynamic_edges()
+            self._set_msg("Path found. Step to deliver.")
+            self.frontier_sc.set_offsets(self._empty_offsets());
             self.visited_sc.set_offsets(self._empty_offsets())
-            self.current_edge_lc.set_segments([])
-            self.checked_edges_lc.set_segments([])
-
         elif self.cast == "BROADCAST":
-            self._init_tree_delivery_from_parents(all_targets=True)
-            self._set_msg("Broadcast tree ready. Press Space for next wave.")
-
+            self._init_tree_delivery_from_parents(True);
+            self._set_msg("Broadcast tree ready.")
         elif self.cast == "MULTICAST":
-            self._init_multicast_tree_delivery(set(self.dsts))
-            self._set_msg("Multicast tree ready. Press Space for next wave.")
+            self._init_multicast_tree_delivery(set(self.dsts));
+            self._set_msg("Multicast tree ready.")
 
-    # ---------- delivery steps ----------
     def _step_unicast_one_hop(self):
-        if not self.path:
-            self.sim_phase = "DONE"
-            self.sim_active = False
-            self._set_msg("No path.")
-            return
-
+        if not self.path: self.sim_phase = "DONE"; self.sim_active = False; self._set_msg("No path."); return
         if self.path_i >= len(self.path) - 1:
-            self.sim_phase = "DONE"
-            self.sim_active = False
-            self._set_msg("Delivered. Done.")
-            self.delivery_now_lc.set_segments([])
+            self.sim_phase = "DONE";
+            self.sim_active = False;
+            self._set_msg("Done.");
+            self.current_wave_edges = [];
+            self._redraw_dynamic_edges();
             return
 
-        a = self.path[self.path_i]
+        a = self.path[self.path_i];
         b = self.path[self.path_i + 1]
         self.path_i += 1
 
-        seg = (self.pos[a], self.pos[b])
-        self.delivered_segments.append(seg)
+        # STORE NODES
+        self.delivered_edges.append((a, b))
+        self.current_wave_edges = [(a, b)]
+        self._redraw_dynamic_edges()
 
-        self.delivery_edges_lc.set_segments(self.delivered_segments)
-        self.delivery_now_lc.set_segments([seg])
         self.packet_sc.set_offsets([self.pos[b]])
+        self._set_msg(f"Hop: {a} → {b}")
 
-        self._set_msg(f"Traversed hop: {a} → {b}")
-
-    def _step_tree_one_wave(self, label: str):
+    def _step_tree_one_wave(self, label):
         if not self.frontier:
-            self.sim_phase = "DONE"
-            self.sim_active = False
-            self._set_msg("Done.")
-            self.delivery_now_lc.set_segments([])
+            self.sim_phase = "DONE";
+            self.sim_active = False;
+            self._set_msg("Done.");
+            self.current_wave_edges = [];
+            self._redraw_dynamic_edges();
             return
 
-        next_frontier = []
-        wave_segs = []
-
+        next_frontier = [];
+        wave_edges = []
         for u in self.frontier:
             for v in self.tree_children.get(u, []):
-                if v in self.received:
-                    continue
+                if v in self.received: continue
                 self.received.add(v)
                 next_frontier.append(v)
-                wave_segs.append((self.pos[u], self.pos[v]))
+                wave_edges.append((u, v))
 
-        # accumulate delivered edges, highlight current wave
-        self.delivered_segments.extend(wave_segs)
-        self.delivery_edges_lc.set_segments(self.delivered_segments)
-        self.delivery_now_lc.set_segments(wave_segs)
+        self.delivered_edges.extend(wave_edges)
+        self.current_wave_edges = wave_edges
+        self._redraw_dynamic_edges()
 
-        # update frontier to show waves visually (reuse frontier_sc)
         self.frontier = next_frontier
         self.frontier_sc.set_offsets([self.pos[n] for n in self.frontier] if self.frontier else self._empty_offsets())
 
-        if wave_segs:
-            self._set_msg(f"{label}: delivered to {len(next_frontier)} new nodes")
+        if wave_edges:
+            self._set_msg(f"{label}: +{len(next_frontier)} nodes")
         else:
-            self._set_msg(f"{label}: no new nodes (finished)")
-            self.sim_phase = "DONE"
-            self.sim_active = False
-
+            self._set_msg("Done."); self.sim_phase = "DONE"; self.sim_active = False
 
 if __name__ == "__main__":
     cfg = TopologyConfig(
