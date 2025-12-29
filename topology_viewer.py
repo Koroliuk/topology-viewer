@@ -672,34 +672,48 @@ class CastViewer:
         self.frontier_sc.set_offsets([self.pos[self.src]])
         self._redraw_dynamic_edges()
 
-    def _step_bfs_one_edge(self):
+    def _step_bfs_one_edge(self, update_visuals=True):
         while self.bfs_q:
             u = self.bfs_q[0]
             if self.bfs_idx[u] < len(self.bfs_neighbors[u]): break
             self.bfs_q.popleft()
+
         if not self.bfs_q:
-            self.current_wave_edges = [];
-            self._redraw_dynamic_edges();
+            if update_visuals:
+                self.current_wave_edges = []
+                self._redraw_dynamic_edges()
             return False
-        u = self.bfs_q[0];
-        v = self.bfs_neighbors[u][self.bfs_idx[u]];
+
+        u = self.bfs_q[0]
+        v = self.bfs_neighbors[u][self.bfs_idx[u]]
         self.bfs_idx[u] += 1
-        self.bfs_checked_edges.append((u, v));
-        self.current_wave_edges = [(u, v)];
-        self._redraw_dynamic_edges()
+
+        self.bfs_checked_edges.append((u, v))
+
+        if update_visuals:
+            self.current_wave_edges = [(u, v)]
+            self._redraw_dynamic_edges()
+
         if v not in self.bfs_visited:
-            self.bfs_visited.add(v);
-            self.bfs_parent[v] = u;
+            self.bfs_visited.add(v)
+            self.bfs_parent[v] = u
             self.bfs_q.append(v)
-        self.visited_sc.set_offsets([self.pos[n] for n in self.bfs_visited])
-        self.frontier_sc.set_offsets([self.pos[n] for n in self.bfs_q] if self.bfs_q else self._empty_offsets())
-        if self.discovery_targets is not None and v in self.discovery_targets: self.discovery_targets_found.add(v)
-        self._set_msg(f"Checked: {u} → {v}");
+
+        if update_visuals:
+            self.visited_sc.set_offsets([self.pos[n] for n in self.bfs_visited])
+            self.frontier_sc.set_offsets([self.pos[n] for n in self.bfs_q] if self.bfs_q else self._empty_offsets())
+
+        if self.discovery_targets is not None and v in self.discovery_targets:
+            self.discovery_targets_found.add(v)
+
+        if update_visuals:
+            self._set_msg(f"Checked: {u} → {v}")
+
         return True
 
     def _build_bfs_parents_full(self):
         self._init_bfs_discovery(None)
-        while self._step_bfs_one_edge(): pass
+        while self._step_bfs_one_edge(update_visuals=False): pass
         self.frontier_sc.set_offsets(self._empty_offsets());
         self.visited_sc.set_offsets(self._empty_offsets())
         self.current_wave_edges = [];
@@ -709,12 +723,15 @@ class CastViewer:
     def _build_bfs_parents_until_targets(self, targets):
         self._init_bfs_discovery(targets)
         while True:
-            if not self._step_bfs_one_edge(): break
-            if self.discovery_targets_found == set(targets): break
-        self.frontier_sc.set_offsets(self._empty_offsets());
+            if not self._step_bfs_one_edge(update_visuals=False):
+                break
+            if self.discovery_targets_found == set(targets):
+                break
+
+        self.frontier_sc.set_offsets(self._empty_offsets())
         self.visited_sc.set_offsets(self._empty_offsets())
-        self.current_wave_edges = [];
-        self.bfs_checked_edges = [];
+        self.current_wave_edges = []
+        self.bfs_checked_edges = []
         self._redraw_dynamic_edges()
 
     def _reconstruct_path(self, dst):
@@ -774,12 +791,18 @@ class CastViewer:
 
     def step_once(self):
         if not self.sim_active or self.sim_phase in ("IDLE", "DONE"): return
+
         if self.sim_phase == "DISCOVERY":
-            if not self._step_bfs_one_edge(): self._finish_discovery(); self.fig.canvas.draw_idle(); return
+            if not self._step_bfs_one_edge(update_visuals=True):
+                self._finish_discovery()
+                self.fig.canvas.draw_idle()
+                return
+
             if self.cast == "UNICAST" and self.dst in self.bfs_visited:
                 self._finish_discovery()
             elif self.cast == "MULTICAST" and self.discovery_targets and self.discovery_targets_found == self.discovery_targets:
                 self._finish_discovery()
+
         elif self.sim_phase == "DELIVERY":
             if self.cast == "UNICAST":
                 self._step_unicast_one_hop()
@@ -787,7 +810,8 @@ class CastViewer:
                 self._step_tree_one_wave("Broadcast wave")
             elif self.cast == "MULTICAST":
                 self._step_tree_one_wave("Multicast wave")
-        self._update_hud();
+
+        self._update_hud()
         self.fig.canvas.draw_idle()
 
     def _finish_discovery(self):
@@ -954,6 +978,14 @@ if __name__ == "__main__":
         ports_per_switch=26,
         min_links_per_group_pair=2,
     )
+    #
+    # cfg = TopologyConfig(
+    #     groups=6,
+    #     subgroups_per_group=4,
+    #     compute_nodes_per_subgroup=8,
+    #     ports_per_switch=26,
+    #     min_links_per_group_pair=2,
+    # )
     G = generate_dragonfly(cfg)
     pos = dragonfly_ring_positions(G, cfg)
 
