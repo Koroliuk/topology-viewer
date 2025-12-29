@@ -1,0 +1,5 @@
+neo4j
+q - 1 metric
+more ways of mutation
+crossingover
+store only photos of 0 gen
