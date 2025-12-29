@@ -12,16 +12,13 @@ import numpy as np
 from matplotlib.patches import FancyArrowPatch
 
 
-# ----------------------------
-# Config
-# ----------------------------
 @dataclass
 class TopologyConfig:
     groups: int = 6
     subgroups_per_group: int = 4
     compute_nodes_per_subgroup: int = 8
     switches_per_subgroup: int = 4
-    ports_per_switch: int = 26  # Adjusted to match your previous run
+    ports_per_switch: int = 26
     min_links_per_group_pair: int = 2
     seed: int = 42
     metric_scope: str = "switches"
@@ -42,11 +39,8 @@ class TopologyConfigError(ValueError):
     pass
 
 
-# ----------------------------
-# Generator
-# ----------------------------
 def generate_dragonfly(cfg: TopologyConfig) -> nx.MultiGraph:
-    rnd = random.Random(cfg.seed)
+    random.Random(cfg.seed)
     G = nx.MultiGraph()
 
     def ordered_switches(gid: int) -> List[str]:
@@ -889,8 +883,55 @@ class CastViewer:
         self._set_msg("")
         if not keep_selection: self.src = None; self.dst = None; self.dsts.clear(); self.dead_nodes.clear()
         self._update_src_dst_markers();
-        self._update_hud();
+        self._update_hud()
         self.fig.canvas.draw_idle()
+
+
+def compute_metrics_custom(G_multi: nx.MultiGraph) -> dict:
+    G_simple = nx.Graph(G_multi)
+
+    N = G_multi.number_of_nodes()
+    if N == 0: return {}
+
+    degrees = [d for n, d in G_multi.degree()]
+    S = max(degrees) if degrees else 0
+
+    # Check connectivity first
+    if nx.is_connected(G_simple):
+        D = nx.diameter(G_simple)
+        D_s = nx.average_shortest_path_length(G_simple)
+    else:
+        # If graph is not connected, use the largest component
+        largest_cc = max(nx.connected_components(G_simple), key=len)
+        subG = G_simple.subgraph(largest_cc)
+        D = nx.diameter(subG)
+        D_s = nx.average_shortest_path_length(subG)
+        print(f"Warning: Graph is not connected. Metrics calculated on largest component ({len(largest_cc)} nodes).")
+
+    T = (2 * D_s) / S if S > 0 else 0.0
+    C = D * N * S
+
+    return {
+        "N": N,
+        "S": S,
+        "D": D,
+        "D_s": D_s,
+        "T": T,
+        "C": C
+    }
+
+
+def print_metrics_custom(m: dict):
+    print("\n" + "=" * 40)
+    print(" ОБЧИСЛЕННЯ ПАРАМЕТРІВ МЕРЕЖІ")
+    print("=" * 40)
+    print(f"Кількість вузлів (N):         {m['N']}")
+    print(f"Ступінь топології (S):        {m['S']}")
+    print(f"Діаметр топології (D):        {m['D']}")
+    print(f"Середній діаметр (D_s):       {m['D_s']:.4f}")
+    print(f"Топологічний трафік (T):      {m['T']:.6f}  (Formula: 2 * D_s / S)")
+    print(f"Вартість системи (C):         {m['C']}       (Formula: D * N * S)")
+    print("=" * 40 + "\n")
 
 
 if __name__ == "__main__":
@@ -898,8 +939,16 @@ if __name__ == "__main__":
     plt.rcParams['keymap.save'] = []
     plt.rcParams['keymap.yscale'] = []
 
+    # cfg = TopologyConfig(
+    #     groups=40,
+    #     subgroups_per_group=4,
+    #     compute_nodes_per_subgroup=8,
+    #     ports_per_switch=34,
+    #     min_links_per_group_pair=2,
+    # )
+
     cfg = TopologyConfig(
-        groups=6,
+        groups=8,
         subgroups_per_group=4,
         compute_nodes_per_subgroup=8,
         ports_per_switch=26,
@@ -908,7 +957,8 @@ if __name__ == "__main__":
     G = generate_dragonfly(cfg)
     pos = dragonfly_ring_positions(G, cfg)
 
-    # Note: metrics function is omitted for brevity, but you can add it back if needed.
-    # The viewer is the main focus here.
+    metrics = compute_metrics_custom(G)
+    print_metrics_custom(metrics)
+
     viewer = CastViewer(G, pos, cfg)
     plt.show()
